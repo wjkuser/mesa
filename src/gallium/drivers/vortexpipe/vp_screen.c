@@ -19,12 +19,16 @@
 
 #include "vp_public.h"
 #include "vp_private.h"
+#include "vp_memory.h"
 #include "llvmpipe/lp_public.h"
 #include "llvmpipe/lp_texture.h"   /* struct llvmpipe_resource: a resource's host base */
 #include "nir.h"
 #include "gallivm/lp_bld_nir.h"
 #include "util/u_memory.h"
 #include "util/log.h"
+#ifdef VP_HACKRTCORE
+#include "registers.h"
+#endif
 
 /* ---- resource residency -------------------------------------------------- *
  * A device buffer per host allocation, living as long as the resource does
@@ -144,6 +148,11 @@ vp_screen_resident_addr(struct pipe_screen *screen, const void *host,
    struct vp_screen *vps = vp_reg_get(screen);
    const uint8_t *p = host;
 
+   if (vp_memory_lookup(screen, host, bytes, out_buf, out_off)) {
+      *out_dirty = true;
+      return (uintptr_t)host;
+   }
+
    simple_mtx_lock(&vps->resident_lock);
    for (unsigned i = 0; i < vps->n_resident; i++) {
       struct vp_resident *e = &vps->resident[i];
@@ -232,6 +241,7 @@ vp_resource_destroy(struct pipe_screen *screen, struct pipe_resource *pres)
       vp_resident_evict_range(vps, base, size);
    }
    vps->lp_resource_destroy(screen, pres);
+   vp_memory_resource_destroy(screen, pres);
 }
 
 static void
@@ -245,6 +255,7 @@ vp_screen_destroy(struct pipe_screen *screen)
     * alive, and each of those would otherwise re-enter vp_resource_destroy
     * after vps has been freed. */
    screen->resource_destroy = vps->lp_resource_destroy;
+   vp_memory_finish(screen);
    for (unsigned i = 0; i < vps->n_resident; i++) {
       vx_buffer_release(vps->resident[i].buf);
    }
@@ -265,6 +276,7 @@ vp_screen_destroy(struct pipe_screen *screen)
       simple_mtx_destroy(&vps->dev_nir_lock);
    }
    vp_reg_del(screen);
+   free(vps->compiler_options);
    FREE(vps);
    lp_destroy(screen);
 }
@@ -298,15 +310,12 @@ static char *
 vp_finalize_nir(struct pipe_screen *screen, struct nir_shader *nir)
 {
    struct vp_screen *vps = vp_reg_get(screen);
-   if (vps && vps->has_rtu)
-      vp_nir_lower_ray_tracing_to_rtu(nir);
 
    /* Vortex emits one flat kernel. The ray-tracing megashader (RTU or software
     * traversal) keeps each pipeline stage (raygen, closest-hit, miss, ...) as a
     * separate nir_function invoked by nir_call; inline them into the entrypoint.
-    * The calls are direct and acyclic — trace-ray recursion is a resume-loop in
-    * the entrypoint, not a nested call. Not gated on the RTU: the software
-    * traversal megashader has the same structure and must also run flat. */
+    * TraceRay functions are specialized by pipeline recursion depth before
+    * inlining. Each call retains its own payload and hit-attribute frame. */
    if (exec_list_length(&nir->functions) > 1) {
       /* nir_inline_functions with driver_functions set only inlines functions
        * flagged should_inline (or small ones); the RT stage functions are
@@ -324,6 +333,8 @@ vp_finalize_nir(struct pipe_screen *screen, struct nir_shader *nir)
     * scratch; promote indexable scratch to SSA/vars where possible (after
     * inlining, so callee scratch is covered) to keep the shader on device. */
    NIR_PASS(_, nir, nir_lower_scratch_to_var);
+   if (vps && vps->has_rtu)
+      vp_nir_lower_ray_tracing_to_rtu(nir);
 
    /* Subgroup lowering constant-folds gl_SubgroupSize and sizes ballot and
     * shuffle lowering, so the width is baked into the shader. llvmpipe
@@ -533,6 +544,14 @@ vp_screen_is_format_supported(struct pipe_screen *screen,
    return vp_device_format_supported(format, usage);
 }
 
+static const void *
+vp_get_compiler_options(struct pipe_screen *screen, enum pipe_shader_ir ir,
+                        enum pipe_shader_type stage)
+{
+   struct vp_screen *vps = vp_reg_get(screen);
+   return vps->compiler_options;
+}
+
 struct pipe_screen *
 vortexpipe_create_screen(struct sw_winsys *winsys)
 {
@@ -573,7 +592,11 @@ vortexpipe_create_screen(struct sw_winsys *winsys)
          vps->has_tex    = (isa & VX_ISA_EXT_TEX)    != 0;
          vps->has_raster = (isa & VX_ISA_EXT_RASTER) != 0;
          vps->has_om     = (isa & VX_ISA_EXT_OM)     != 0;
-         vps->has_rtu    = (isa & VX_ISA_EXT_RTU)    != 0;
+#ifdef VP_HACKRTCORE
+         vps->has_rtu = (isa & HACKRTCORE_ISA_EXT_RTU) != 0;
+#else
+         vps->has_rtu = (isa & VX_ISA_EXT_RTU) != 0;
+#endif
          vp_dbg("vortexpipe: caps: threads=%u, warps=%u, max_block=%u, "
                 "tex=%d, raster=%d, om=%d, rtu=%d",
                 vps->hw_num_threads, vps->hw_num_warps, vps->hw_max_block_size,
@@ -583,8 +606,18 @@ vortexpipe_create_screen(struct sw_winsys *winsys)
          /* Leave caps fields zero — every cap-gated path then refuses. */
       }
    } else {
+#ifdef VP_HACKRTCORE
+      mesa_loge("vortexpipe: Vortex device creation failed");
+      _mesa_hash_table_destroy(vps->dev_nir, NULL);
+      simple_mtx_destroy(&vps->dev_nir_lock);
+      simple_mtx_destroy(&vps->resident_lock);
+      free(vps);
+      screen->destroy(screen);
+      return NULL;
+#else
       mesa_logw("vortexpipe: no Vortex device; compute falls back to llvmpipe");
       vps->dev = NULL;
+#endif
    }
 
    /* Patch the entry points vortexpipe intercepts; record originals. */
@@ -596,12 +629,23 @@ vortexpipe_create_screen(struct sw_winsys *winsys)
    vps->lp_resource_destroy    = screen->resource_destroy;
    vp_reg_put(screen, vps);
 
+   vps->compiler_options = malloc(sizeof(*vps->compiler_options));
+   memcpy(vps->compiler_options,
+          screen->get_compiler_options(screen, PIPE_SHADER_IR_NIR, PIPE_SHADER_COMPUTE),
+          sizeof(*vps->compiler_options));
+   vps->compiler_options->lower_ffma32 = false;
+   vps->compiler_options->lower_ffma64 = false;
+   screen->get_compiler_options = vp_get_compiler_options;
+
    screen->context_create      = vp_context_create;
    screen->destroy             = vp_screen_destroy;
    screen->get_name            = vp_screen_get_name;
    screen->finalize_nir        = vp_finalize_nir;
    screen->is_format_supported = vp_screen_is_format_supported;
    screen->resource_destroy    = vp_resource_destroy;
+#ifdef VP_COMPUTE_ONLY
+   vp_memory_init(screen);
+#endif
 
    /* Clamp llvmpipe's compute caps to the Vortex hardware cap so well-
     * behaved Vulkan apps that read maxComputeWorkGroupSize /

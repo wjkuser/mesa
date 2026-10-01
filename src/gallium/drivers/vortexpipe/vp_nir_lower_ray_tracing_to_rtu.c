@@ -33,6 +33,9 @@
  * here: a local copy is a second source of truth that silently decays into
  * reads of the wrong slot when the window is renumbered. */
 #include "VX_types.h"
+#ifdef VP_HACKRTCORE
+#include "registers.h"
+#endif
 
 /* Committed RayQueryIntersection types (SPIR-V): None=0, Triangle=1,
  * Generated=2. */

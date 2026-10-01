@@ -52,6 +52,7 @@ endif
 # linked against the XLEN-matched libvortex2.a, and the driver picks the
 # image matching the device at load time (vp_gfx_frontend_vxbin).
 gfx_frontend_vxbin_h = []
+if get_option('vortex-graphics')
 foreach vp_xlen : [['32', vp_vortex_build], ['64', vp_vortex_build64]]
   gfx_frontend_vxbin = custom_target(
     'gfx_frontend' + vp_xlen[0] + '.vxbin',
@@ -99,24 +100,30 @@ foreach vp_xlen : [['32', vp_vortex_build], ['64', vp_vortex_build64]]
                '-n', 'gfx_frontend_vxbin' + vp_xlen[0]],
   )
 endforeach
+endif
 
 files_vortexpipe = files(
   'vp_public.h',
   'vp_private.h',
   'vp_screen.c',
-  'vp_context.c',
+  'vp_memory.c',
   'vp_nir_to_llvm.h',
   'vp_nir_to_llvm.c',
-  'vp_nir_lower_ray_tracing_to_rtu.c',
   'vp_compile.h',
   'vp_compile.c',
   'vp_launch.h',
   'vp_launch.c',
-  'vp_raster.h',
-  'vp_raster.cpp',
-  'vp_gfx_frontend.h',
-  'vp_gfx_frontend.c',
 )
+if get_option('vortex-rtu-path') != ''
+  files_vortexpipe += files('vp_nir_ray_query.c', 'vp_scene.cpp')
+else
+  files_vortexpipe += files('vp_nir_lower_ray_tracing_to_rtu.c')
+endif
+if get_option('vortex-graphics')
+  files_vortexpipe += files('vp_context.c', 'vp_raster.cpp', 'vp_gfx_frontend.c')
+else
+  files_vortexpipe += files('vp_compute.c')
+endif
 
 # Toolchain paths for vp_compile.c (.vxbin generation). vortex-tooldir
 # points at the LLVM-vortex / kernel-build toolchain prefix; vortex-path
@@ -134,6 +141,12 @@ vp_def_args = [
   '-DVP_TOOLDIR="'     + get_option('vortex-tooldir') + '"',
   '-I' + vp_vortex_home / 'sw' / 'common',
 ]
+if not get_option('vortex-graphics')
+  vp_def_args += ['-DVP_COMPUTE_ONLY']
+endif
+if get_option('vortex-rtu-path') != ''
+  vp_def_args += ['-DVP_HACKRTCORE', '-I' + get_option('vortex-rtu-path') / 'common']
+endif
 
 libvortexpipe = static_library(
   'vortexpipe',

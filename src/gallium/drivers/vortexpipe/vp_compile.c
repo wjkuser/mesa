@@ -165,17 +165,16 @@ vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
       bd = bd_buf;
    }
 
-   /* Cache lookup. The key covers the IR and every input that shapes the
-    * toolchain invocation; VP_CACHE_VERSION is bumped whenever the command
-    * built below changes in a way the listed inputs do not capture. */
-   enum { VP_CACHE_VERSION = 1 };
+   /* Preserve branch-local stores so Vortex split/join regions stay nested. */
+   const char *simt_options = "-mllvm -vortex-divergence-max-bbs=65536 "
+                              "-mllvm -simplifycfg-sink-common=false";
    char cache_path[640];
    bool cache_enabled = !getenv("VORTEXPIPE_NO_CACHE");
    cache_path[0] = '\0';
    if (cache_enabled) {
       char cfg[1024];
-      snprintf(cfg, sizeof cfg, "%d|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%llx|%d",
-               VP_CACHE_VERSION, td, vh, bd, target, gnu_dir, march, mabi,
+      snprintf(cfg, sizeof cfg, "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%llx|%d",
+               simt_options, td, vh, bd, target, gnu_dir, march, mabi,
                linker, libc, libcrt, startup_addr, link_gfx_sw ? 1 : 0);
       uint64_t key = vp_hash(0xcbf29ce484222325ull, cfg, strlen(cfg));
       key = vp_hash(key, llvm_ir, strlen(llvm_ir));
@@ -231,7 +230,6 @@ vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
        * baremetal link has no __assert_func, so compile assertions out. */
       snprintf(gfx_seg, sizeof gfx_seg,
          "-std=c++17 -DNDEBUG -D__VORTEX__ -DGFX_SW_DIVERGENCE_OK "
-         "-mllvm -vortex-divergence-max-bbs=65536 "
          "-I%s/sw/gfx -I%s/sw/common -I%s/third_party -I%s/sw %s/sw/gfx/gfx_sw_abi.cpp",
          vh, vh, vh, bd, vh);
    }
@@ -254,7 +252,7 @@ vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
             "-march=%s -mabi=%s "
             "-Xclang -target-feature -Xclang +xvortex "
             "-Xclang -target-feature -Xclang +zicond "
-            "-mllvm -disable-loop-idiom-all "
+            "-mllvm -disable-loop-idiom-all %s "
             "-Wno-unused-command-line-argument -Wno-override-module "
             "-O3 -mcmodel=medany -nostartfiles -nostdlib "
             "-fdata-sections -ffunction-sections -fuse-ld=lld "
@@ -269,6 +267,7 @@ vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
             td, gnu_dir, target,
             td, gnu_dir,
             march, mabi,
+            simt_options,
             p_ll, gfx_seg,
             vh, linker,
             startup_addr,

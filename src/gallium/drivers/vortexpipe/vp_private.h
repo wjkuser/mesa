@@ -27,7 +27,9 @@
 #include "vortex2.h"
 #include "VX_types.h"            /* VX_TEX_LOD_MAX */
 #include "vp_nir_to_llvm.h"      /* struct vp_vs_layout */
-#include "gfx_fs_desc_abi.h"     /* GFX_OM_MAX_RT */
+#ifndef VP_COMPUTE_ONLY
+#include "gfx_fs_desc_abi.h"
+#endif
 
 /* vp_raster.cpp is C++; the declarations below are defined in C translation
  * units, so their linkage has to be spelled out or the C++ caller looks for a
@@ -39,6 +41,7 @@ extern "C" {
 /* Per-screen vortexpipe state, keyed by the llvmpipe pipe_screen *. */
 struct vp_screen {
    vx_device_h dev;                       /* Vortex device, or NULL */
+   struct nir_shader_compiler_options *compiler_options;
    struct pipe_context *(*lp_context_create)(struct pipe_screen *,
                                              void *priv, unsigned flags);
    void (*lp_screen_destroy)(struct pipe_screen *);
@@ -97,6 +100,7 @@ struct vp_screen {
     * resource -- this driver has already been bitten by pointer recycling
     * aliasing a driver-side cache. */
    struct vp_resident *resident;
+   struct vp_memory *memory;
    unsigned            n_resident;
    unsigned            resident_cap;
    simple_mtx_t        resident_lock;
@@ -176,6 +180,9 @@ void vp_as_end(struct vp_as_ctx *c);
  * translator reads is a property of the NIR and so is invariant across
  * variants. Keep this minimal -- every dimension multiplies compile time and
  * device residency churn. */
+#ifdef VP_COMPUTE_ONLY
+#include "vp_compute.h"
+#else
 struct vp_fs_variant_key {
    struct vp_sw_routing routing;
    unsigned             samples;   /* 1, or the pass' sample count */
@@ -655,6 +662,8 @@ struct vp_context {
    void (*lp_render_condition_mem)(struct pipe_context *, struct pipe_resource *,
                                    uint32_t, bool);
 };
+
+#endif
 
 /* Pointer-keyed side registry (see file header). */
 void  vp_reg_put(const void *key, void *data);

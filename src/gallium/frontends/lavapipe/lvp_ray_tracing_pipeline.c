@@ -12,7 +12,11 @@
  * VX_types.toml). Used by the hardware ray-traversal path below, which lowers
  * VkTraceRaysKHR onto the RTU via the vortex_rt_* NIR intrinsics — the same
  * intrinsics vortexpipe already emits for VK_KHR_ray_query. */
+#ifndef VP_HACKRTCORE
 #include "VX_types.h"
+#else
+#include "scene_layout.h"
+#endif
 
 #include "vk_pipeline.h"
 
@@ -281,6 +285,7 @@ struct lvp_ray_tracing_state {
     * index as a value, not the instance-node device address the software path
     * reads it from, so stage it here and short-circuit the intrinsic. */
    nir_variable *rtu_instance_custom_index;
+   nir_variable *rtu_instance_id;
 
    nir_variable *shader_record_ptr;
    nir_variable *stack_ptr;
@@ -293,13 +298,25 @@ struct lvp_ray_tracing_state {
    struct lvp_ray_traversal_state traversal;
 };
 
+struct lvp_rt_function {
+   nir_shader *stage;
+   nir_function *function;
+   unsigned trace_depth;
+   unsigned call_depth;
+   nir_shader *ahit;
+};
+
 struct lvp_ray_tracing_pipeline_compiler {
    struct lvp_pipeline *pipeline;
    VkPipelineCreateFlags2KHR flags;
 
    struct lvp_ray_tracing_state state;
 
-   struct hash_table *functions;
+   struct util_dynarray functions;
+   unsigned trace_depth;
+   unsigned call_depth;
+   unsigned max_trace_depth;
+   nir_shader *isec_ahit;
 
    uint32_t raygen_size;
    uint32_t ahit_size;
@@ -313,12 +330,9 @@ static uint32_t
 lvp_ray_tracing_pipeline_compiler_get_stack_size(
    struct lvp_ray_tracing_pipeline_compiler *compiler, nir_function *function)
 {
-   hash_table_foreach(compiler->functions, entry) {
-      if (entry->data == function) {
-         const nir_shader *shader = entry->key;
-         return shader->scratch_size;
-      }
-   }
+   util_dynarray_foreach(&compiler->functions, struct lvp_rt_function, entry)
+      if (entry->function == function)
+         return entry->stage->scratch_size;
    return 0;
 }
 
@@ -342,6 +356,7 @@ lvp_ray_tracing_state_init(nir_shader *nir, struct lvp_ray_tracing_state *state)
    state->hit_kind = nir_variable_create(nir, nir_var_shader_temp, glsl_uint_type(), "hit_kind");
    state->sbt_index = nir_variable_create(nir, nir_var_shader_temp, glsl_uint_type(), "sbt_index");
    state->rtu_instance_custom_index = nir_variable_create(nir, nir_var_shader_temp, glsl_uint_type(), "rtu_instance_custom_index");
+   state->rtu_instance_id = nir_variable_create(nir, nir_var_shader_temp, glsl_uint_type(), "rtu_instance_id");
 
    state->shader_record_ptr = nir_variable_create(nir, nir_var_shader_temp, glsl_uint64_t_type(), "shader_record_ptr");
    state->stack_ptr = nir_variable_create(nir, nir_var_shader_temp, glsl_uint_type(), "stack_ptr");
@@ -369,15 +384,19 @@ lvp_ray_traversal_state_init(nir_function_impl *impl, struct lvp_ray_traversal_s
    state->sbt_offset_and_flags = nir_local_variable_create(impl, glsl_uint_type(), "traversal.sbt_offset_and_flags");
 }
 
-static void
+static nir_function *
 lvp_call_ray_tracing_stage(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *compiler, nir_shader *stage)
 {
-   nir_function *function;
-
-   struct hash_entry *entry = _mesa_hash_table_search(compiler->functions, stage);
-   if (entry) {
-      function = entry->data;
-   } else {
+   nir_function *function = NULL;
+   nir_shader *ahit = stage->info.stage == MESA_SHADER_INTERSECTION ? compiler->isec_ahit : NULL;
+   util_dynarray_foreach(&compiler->functions, struct lvp_rt_function, entry) {
+      if (entry->stage == stage && entry->trace_depth == compiler->trace_depth &&
+          entry->call_depth == compiler->call_depth && entry->ahit == ahit) {
+         function = entry->function;
+         break;
+      }
+   }
+   if (!function) {
       nir_function_impl *stage_entrypoint = nir_shader_get_entrypoint(stage);
       nir_function_impl *copy = nir_function_impl_clone(b->shader, stage_entrypoint);
 
@@ -411,7 +430,10 @@ lvp_call_ray_tracing_stage(nir_builder *b, struct lvp_ray_tracing_pipeline_compi
 
       ralloc_free(var_remap);
 
-      _mesa_hash_table_insert(compiler->functions, stage, function);
+      struct lvp_rt_function entry = {
+         stage, function, compiler->trace_depth, compiler->call_depth, ahit,
+      };
+      util_dynarray_append(&compiler->functions, struct lvp_rt_function, entry);
    }
 
    nir_build_call(b, function, 0, NULL);
@@ -439,6 +461,7 @@ lvp_call_ray_tracing_stage(nir_builder *b, struct lvp_ray_tracing_pipeline_compi
       unreachable("Invalid ray tracing stage");
       break;
    }
+   return function;
 }
 
 static void
@@ -446,6 +469,12 @@ lvp_execute_callable(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *c
                      nir_intrinsic_instr *instr)
 {
    struct lvp_ray_tracing_state *state = &compiler->state;
+
+   if (compiler->call_depth == 31)
+      return;
+   compiler->call_depth++;
+   nir_def *record = nir_load_var(b, state->shader_record_ptr);
+   nir_def *argument = nir_load_var(b, state->shader_call_data_offset);
 
    nir_def *sbt_index = instr->src[0].ssa;
    nir_def *payload = instr->src[1].ssa;
@@ -479,11 +508,15 @@ lvp_execute_callable(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *c
    }
 
    nir_store_var(b, state->stack_ptr, stack_ptr, 0x1);
+   nir_store_var(b, state->shader_record_ptr, record, 1);
+   nir_store_var(b, state->shader_call_data_offset, argument, 1);
+   compiler->call_depth--;
 }
 
 struct lvp_lower_isec_intrinsic_state {
    struct lvp_ray_tracing_pipeline_compiler *compiler;
    nir_shader *ahit;
+   nir_function *function;
 };
 
 static bool
@@ -493,6 +526,8 @@ lvp_lower_isec_intrinsic(nir_builder *b, nir_intrinsic_instr *instr, void *data)
       return false;
 
    struct lvp_lower_isec_intrinsic_state *isec_state = data;
+   if (b->impl->function != isec_state->function)
+      return false;
    struct lvp_ray_tracing_pipeline_compiler *compiler = isec_state->compiler;
    struct lvp_ray_tracing_state *state = &compiler->state;
 
@@ -607,17 +642,19 @@ lvp_handle_aabb_intersection(nir_builder *b, struct lvp_leaf_intersection *inter
 
       nir_shader *stage = compiler->pipeline->rt.stages[group->isec_index]->nir;
 
-      nir_push_if(b, nir_ieq_imm(b, isec_entry.value, group->handle.index));
-      lvp_call_ray_tracing_stage(b, compiler, stage);
-      nir_pop_if(b, NULL);
+      nir_shader *ahit_stage = group->ahit_index == VK_SHADER_UNUSED_KHR ? NULL :
+         compiler->pipeline->rt.stages[group->ahit_index]->nir;
+      compiler->isec_ahit = ahit_stage;
 
-      nir_shader *ahit_stage = NULL;
-      if (group->ahit_index != VK_SHADER_UNUSED_KHR)
-         ahit_stage = compiler->pipeline->rt.stages[group->ahit_index]->nir;
+      nir_push_if(b, nir_ieq_imm(b, isec_entry.value, group->handle.index));
+      nir_function *function = lvp_call_ray_tracing_stage(b, compiler, stage);
+      nir_pop_if(b, NULL);
+      compiler->isec_ahit = NULL;
 
       struct lvp_lower_isec_intrinsic_state isec_state = {
          .compiler = compiler,
          .ahit = ahit_stage,
+         .function = function,
       };
       nir_shader_intrinsics_pass(b->shader, lvp_lower_isec_intrinsic,
                                  nir_metadata_none, &isec_state);
@@ -628,7 +665,9 @@ lvp_handle_aabb_intersection(nir_builder *b, struct lvp_leaf_intersection *inter
       nir_store_var(b, state->sbt_index, sbt_index, 0x1);
       nir_store_var(b, state->traversal.hit, nir_imm_true(b), 0x1);
 
+#ifndef VP_HACKRTCORE
       nir_break_if(b, nir_load_var(b, state->terminate));
+#endif
    }
    nir_push_else(b, NULL);
    {
@@ -704,7 +743,9 @@ lvp_handle_triangle_intersection(nir_builder *b,
       nir_store_var(b, state->sbt_index, sbt_index, 0x1);
       nir_store_var(b, state->traversal.hit, nir_imm_true(b), 0x1);
 
+#ifndef VP_HACKRTCORE
       nir_break_if(b, nir_load_var(b, state->terminate));
+#endif
    }
    nir_push_else(b, NULL);
    {
@@ -729,6 +770,7 @@ lvp_handle_triangle_intersection(nir_builder *b,
  * software path for now. The acceleration structure is transcoded to the RTU
  * CW-BVH format at launch (vp_launch, has_rtu) exactly as for ray queries, so
  * `accel_struct` is the same handle the software path would walk. */
+#ifndef VP_HACKRTCORE
 static void
 lvp_trace_ray_rtu(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *compiler,
                   nir_def *accel_struct, nir_def *flags, nir_def *cull_mask,
@@ -781,11 +823,144 @@ lvp_trace_ray_rtu(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *comp
    nir_store_var(b, state->sbt_index, sbt_index, 0x1);
 }
 
+#endif
+
+#ifdef VP_HACKRTCORE
+static nir_def *
+lvp_rtu_query_value(nir_builder *b, nir_def *query, nir_ray_query_value value,
+                    bool committed)
+{
+   unsigned components = value == nir_ray_query_value_intersection_barycentrics ? 2 : 1;
+   unsigned bits = value == nir_ray_query_value_intersection_front_face ||
+                   value == nir_ray_query_value_intersection_candidate_aabb_opaque ? 1 : 32;
+   return nir_rq_load(b, components, bits, query,
+                     .ray_query_value = value, .committed = committed);
+}
+
+static void
+lvp_rtu_instance(nir_builder *b, struct lvp_ray_tracing_state *state,
+                 nir_def *query, nir_def *scene, bool committed)
+{
+   nir_def *id = lvp_rtu_query_value(b, query, nir_ray_query_value_intersection_instance_id, committed);
+   nir_def *table = nir_build_load_global(b, 1, 32,
+      nir_iadd_imm(b, scene, RTU_SCENE_INSTANCE_TABLE_OFFSET));
+   nir_def *address = nir_iadd(b, scene, nir_u2u64(b,
+      nir_iadd(b, table, nir_imul_imm(b, id, RTU_INSTANCE_METADATA_BYTES))));
+   nir_store_var(b, state->rtu_instance_id, id, 1);
+   nir_store_var(b, state->rtu_instance_custom_index,
+      lvp_rtu_query_value(b, query, nir_ray_query_value_intersection_instance_custom_index, committed), 1);
+   nir_store_var(b, state->traversal.instance_addr, address, 1);
+   nir_store_var(b, state->traversal.sbt_offset_and_flags,
+      lvp_rtu_query_value(b, query, nir_ray_query_value_intersection_instance_sbt_index, committed), 1);
+}
+
+static void
+lvp_trace_ray_query(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *compiler,
+                    nir_def *scene, nir_def *flags, nir_def *mask,
+                    nir_def *origin, nir_def *tmin, nir_def *direction, nir_def *tmax)
+{
+   struct lvp_ray_tracing_state *state = &compiler->state;
+   nir_variable *variable = nir_local_variable_create(b->impl, glsl_uint_type(), "traversal_query");
+   variable->data.ray_query = true;
+   nir_def *query = &nir_build_deref_var(b, variable)->def;
+   nir_rq_initialize(b, query, scene, flags, mask, origin, tmin, direction, tmax);
+   struct lvp_ray_traversal_args args = { .data = compiler };
+   struct lvp_ray_flags ray_flags = {
+      .terminate_on_first_hit = nir_test_mask(b, flags, SpvRayFlagsTerminateOnFirstHitKHRMask),
+   };
+   nir_push_loop(b);
+   nir_break_if(b, nir_inot(b, nir_rq_proceed(b, 1, query)));
+   lvp_rtu_instance(b, state, query, scene, false);
+   struct lvp_leaf_intersection leaf = {
+      .primitive_id = lvp_rtu_query_value(b, query, nir_ray_query_value_intersection_primitive_index, false),
+      .geometry_id_and_flags = lvp_rtu_query_value(b, query, nir_ray_query_value_intersection_geometry_index, false),
+      .opaque = lvp_rtu_query_value(b, query, nir_ray_query_value_intersection_candidate_aabb_opaque, false),
+   };
+   nir_store_var(b, state->accept, nir_imm_false(b), 1);
+   nir_def *type = lvp_rtu_query_value(b, query, nir_ray_query_value_intersection_type, false);
+   nir_push_if(b, nir_ieq_imm(b, type, 0));
+   {
+      struct lvp_triangle_intersection triangle = {
+         .base = leaf,
+         .t = lvp_rtu_query_value(b, query, nir_ray_query_value_intersection_t, false),
+         .frontface = lvp_rtu_query_value(b, query, nir_ray_query_value_intersection_front_face, false),
+         .barycentrics = lvp_rtu_query_value(b, query, nir_ray_query_value_intersection_barycentrics, false),
+      };
+      triangle.base.opaque = nir_imm_false(b);
+      lvp_handle_triangle_intersection(b, &triangle, &args, &ray_flags);
+      nir_push_if(b, nir_load_var(b, state->accept));
+      nir_rq_confirm_intersection(b, query);
+      nir_pop_if(b, NULL);
+   }
+   nir_push_else(b, NULL);
+   {
+      nir_def *attributes[2];
+      for (unsigned i = 0; i < 2; ++i)
+         attributes[i] = nir_load_scratch(b, 4, 32,
+            nir_iadd_imm(b, nir_load_var(b, state->stack_ptr), i * 16));
+      lvp_handle_aabb_intersection(b, &leaf, &args, &ray_flags);
+      nir_push_if(b, nir_load_var(b, state->accept));
+      nir_rq_generate_intersection(b, query, nir_load_var(b, state->tmax));
+      nir_push_else(b, NULL);
+      for (unsigned i = 0; i < 2; ++i)
+         nir_store_scratch(b, attributes[i],
+            nir_iadd_imm(b, nir_load_var(b, state->stack_ptr), i * 16));
+      nir_pop_if(b, NULL);
+   }
+   nir_pop_if(b, NULL);
+   nir_push_if(b, nir_iand(b, nir_load_var(b, state->accept), nir_load_var(b, state->terminate)));
+   nir_rq_terminate(b, query);
+   nir_jump(b, nir_jump_break);
+   nir_pop_if(b, NULL);
+   nir_pop_loop(b, NULL);
+
+   nir_def *committed_type = lvp_rtu_query_value(b, query, nir_ray_query_value_intersection_type, true);
+   nir_def *hit = nir_ine_imm(b, committed_type, 0);
+   nir_store_var(b, state->traversal.hit, hit, 1);
+   nir_push_if(b, hit);
+   lvp_rtu_instance(b, state, query, scene, true);
+   nir_store_var(b, state->instance_addr, nir_load_var(b, state->traversal.instance_addr), 1);
+   nir_store_var(b, state->primitive_id,
+      lvp_rtu_query_value(b, query, nir_ray_query_value_intersection_primitive_index, true), 1);
+   nir_def *geometry = lvp_rtu_query_value(b, query, nir_ray_query_value_intersection_geometry_index, true);
+   nir_store_var(b, state->geometry_id_and_flags, geometry, 1);
+   nir_store_var(b, state->tmax,
+      lvp_rtu_query_value(b, query, nir_ray_query_value_intersection_t, true), 1);
+   nir_store_var(b, state->sbt_index, nir_iadd(b,
+      nir_iadd(b, nir_load_var(b, state->sbt_offset), nir_load_var(b, state->traversal.sbt_offset_and_flags)),
+      nir_imul(b, nir_load_var(b, state->sbt_stride), geometry)), 1);
+   nir_push_if(b, nir_ieq_imm(b, committed_type, 1));
+   nir_store_var(b, state->hit_kind, nir_bcsel(b,
+      lvp_rtu_query_value(b, query, nir_ray_query_value_intersection_front_face, true),
+      nir_imm_int(b, 0xfe), nir_imm_int(b, 0xff)), 1);
+   nir_store_scratch(b,
+      lvp_rtu_query_value(b, query, nir_ray_query_value_intersection_barycentrics, true),
+      nir_load_var(b, state->stack_ptr));
+   nir_pop_if(b, NULL);
+   nir_pop_if(b, NULL);
+}
+#endif
+
 static void
 lvp_trace_ray(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *compiler,
               nir_intrinsic_instr *instr)
 {
    struct lvp_ray_tracing_state *state = &compiler->state;
+   if (compiler->trace_depth == compiler->max_trace_depth)
+      return;
+   compiler->trace_depth++;
+   nir_variable *saved_vars[] = {
+      state->bvh_base, state->flags, state->cull_mask, state->sbt_offset,
+      state->sbt_stride, state->miss_index, state->origin, state->tmin,
+      state->dir, state->tmax, state->instance_addr, state->primitive_id,
+      state->geometry_id_and_flags, state->hit_kind, state->sbt_index,
+      state->rtu_instance_custom_index, state->rtu_instance_id,
+      state->shader_record_ptr, state->shader_call_data_offset,
+      state->accept, state->terminate, state->opaque,
+   };
+   nir_def *saved[ARRAY_SIZE(saved_vars)];
+   for (unsigned i = 0; i < ARRAY_SIZE(saved_vars); ++i)
+      saved[i] = nir_load_var(b, saved_vars[i]);
 
    nir_def *accel_struct = instr->src[0].ssa;
    nir_def *flags = instr->src[1].ssa;
@@ -821,12 +996,16 @@ lvp_trace_ray(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *compiler
 
    nir_store_var(b, state->traversal.hit, nir_imm_false(b), 0x1);
 
+#ifdef VP_HACKRTCORE
+   lvp_trace_ray_query(b, compiler, accel_struct, flags, cull_mask, origin, tmin, dir, tmax);
+#else
    if (compiler->pipeline->device->pscreen->caps.driver_ray_queries) {
       /* Vortex RTU present: resolve the ray in hardware. */
       nir_push_if(b, nir_ine_imm(b, accel_struct, 0));
       lvp_trace_ray_rtu(b, compiler, accel_struct, flags, cull_mask, origin, tmin, dir, tmax);
       nir_pop_if(b, NULL);
-   } else {
+   } else
+   {
       nir_store_var(b, state->traversal.bvh_base, accel_struct, 0x1);
       nir_store_var(b, state->traversal.origin, origin, 0x7);
       nir_store_var(b, state->traversal.dir, dir, 0x7);
@@ -868,6 +1047,7 @@ lvp_trace_ray(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *compiler
       lvp_build_ray_traversal(b, &args);
       nir_pop_if(b, NULL);
    }
+#endif
 
    nir_push_if(b, nir_load_var(b, state->traversal.hit));
    {
@@ -923,6 +1103,20 @@ lvp_trace_ray(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *compiler
    nir_pop_if(b, NULL);
 
    nir_store_var(b, state->stack_ptr, stack_ptr, 0x1);
+   for (unsigned i = 0; i < ARRAY_SIZE(saved_vars); ++i)
+      nir_store_var(b, saved_vars[i], saved[i], BITFIELD_MASK(saved[i]->num_components));
+   compiler->trace_depth--;
+}
+
+static void
+lvp_shader_wto_matrix(nir_builder *b, nir_def *address, nir_def *rows[3])
+{
+#ifdef VP_HACKRTCORE
+   for (unsigned r = 0; r < 3; ++r)
+      rows[r] = nir_build_load_global(b, 4, 32, nir_iadd_imm(b, address, 48 + r * 16));
+#else
+   lvp_load_wto_matrix(b, address, NULL, rows);
+#endif
 }
 
 static bool
@@ -930,6 +1124,15 @@ lvp_lower_ray_tracing_instr(nir_builder *b, nir_instr *instr, void *data)
 {
    struct lvp_ray_tracing_pipeline_compiler *compiler = data;
    struct lvp_ray_tracing_state *state = &compiler->state;
+
+   compiler->trace_depth = compiler->call_depth = 0;
+   util_dynarray_foreach(&compiler->functions, struct lvp_rt_function, entry) {
+      if (entry->function == b->impl->function) {
+         compiler->trace_depth = entry->trace_depth;
+         compiler->call_depth = entry->call_depth;
+         break;
+      }
+   }
 
    if (instr->type == nir_instr_type_jump) {
       nir_jump_instr *jump = nir_instr_as_jump(instr);
@@ -1018,9 +1221,13 @@ lvp_lower_ray_tracing_instr(nir_builder *b, nir_instr *instr, void *data)
       def = nir_iand_imm(b, def, 0xFFFFFFF);
       break;
    case nir_intrinsic_load_instance_id: {
+#ifdef VP_HACKRTCORE
+      def = nir_load_var(b, state->rtu_instance_id);
+#else
       nir_def *instance_node_addr = nir_load_var(b, state->instance_addr);
       def = nir_build_load_global(
          b, 1, 32, nir_iadd_imm(b, instance_node_addr, offsetof(struct lvp_bvh_instance_node, instance_id)));
+#endif
       break;
    }
    case nir_intrinsic_load_ray_flags:
@@ -1033,7 +1240,7 @@ lvp_lower_ray_tracing_instr(nir_builder *b, nir_instr *instr, void *data)
       unsigned c = nir_intrinsic_column(intr);
       nir_def *instance_node_addr = nir_load_var(b, state->instance_addr);
       nir_def *wto_matrix[3];
-      lvp_load_wto_matrix(b, instance_node_addr, NULL, wto_matrix);
+      lvp_shader_wto_matrix(b, instance_node_addr, wto_matrix);
 
       nir_def *vals[3];
       for (unsigned i = 0; i < 3; ++i)
@@ -1046,24 +1253,28 @@ lvp_lower_ray_tracing_instr(nir_builder *b, nir_instr *instr, void *data)
       unsigned c = nir_intrinsic_column(intr);
       nir_def *instance_node_addr = nir_load_var(b, state->instance_addr);
       nir_def *rows[3];
+      unsigned matrix_offset = 0;
+#ifndef VP_HACKRTCORE
+      matrix_offset = offsetof(struct lvp_bvh_instance_node, otw_matrix);
+#endif
       for (unsigned r = 0; r < 3; ++r)
          rows[r] = nir_build_load_global(
             b, 4, 32,
-            nir_iadd_imm(b, instance_node_addr, offsetof(struct lvp_bvh_instance_node, otw_matrix) + r * 16));
+            nir_iadd_imm(b, instance_node_addr, matrix_offset + r * 16));
       def = nir_vec3(b, nir_channel(b, rows[0], c), nir_channel(b, rows[1], c), nir_channel(b, rows[2], c));
       break;
    }
    case nir_intrinsic_load_ray_object_origin: {
       nir_def *instance_node_addr = nir_load_var(b, state->instance_addr);
       nir_def *wto_matrix[3];
-      lvp_load_wto_matrix(b, instance_node_addr, NULL, wto_matrix);
+      lvp_shader_wto_matrix(b, instance_node_addr, wto_matrix);
       def = lvp_mul_vec3_mat(b, nir_load_var(b, state->origin), wto_matrix, true);
       break;
    }
    case nir_intrinsic_load_ray_object_direction: {
       nir_def *instance_node_addr = nir_load_var(b, state->instance_addr);
       nir_def *wto_matrix[3];
-      lvp_load_wto_matrix(b, instance_node_addr, NULL, wto_matrix);
+      lvp_shader_wto_matrix(b, instance_node_addr, wto_matrix);
       def = lvp_mul_vec3_mat(b, nir_load_var(b, state->dir), wto_matrix, false);
       break;
    }
@@ -1123,14 +1334,19 @@ lvp_compile_ray_tracing_pipeline(struct lvp_pipeline *pipeline,
       "ray tracing pipeline");
    nir_builder *b = &_b;
 
+#ifdef VP_HACKRTCORE
+   b->shader->info.workgroup_size[0] = 32;
+#else
    b->shader->info.workgroup_size[0] = 8;
+#endif
 
    struct lvp_ray_tracing_pipeline_compiler compiler = {
       .pipeline = pipeline,
       .flags = vk_rt_pipeline_create_flags(create_info),
+      .max_trace_depth = create_info->maxPipelineRayRecursionDepth,
    };
    lvp_ray_tracing_state_init(b->shader, &compiler.state);
-   compiler.functions = _mesa_pointer_hash_table_create(NULL);
+   util_dynarray_init(&compiler.functions, NULL);
 
    nir_def *launch_id = nir_load_ray_launch_id(b);
    nir_def *launch_size = nir_load_ray_launch_size(b);
@@ -1199,7 +1415,7 @@ lvp_compile_ray_tracing_pipeline(struct lvp_pipeline *pipeline,
    lvp_shader_init(shader, b->shader);
    shader->shader_cso = lvp_shader_compile(pipeline->device, shader, nir_shader_clone(NULL, shader->pipeline_nir->nir), false);
 
-   _mesa_hash_table_destroy(compiler.functions, NULL);
+   util_dynarray_fini(&compiler.functions);
 }
 
 static VkResult

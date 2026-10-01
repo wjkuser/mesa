@@ -26,6 +26,11 @@ extern "C" {
  * binding N's descriptor starts at N * VP_DESC_STRIDE. */
 #define VP_DESC_STRIDE 256
 
+struct vp_const_buffer {
+   const void *host;
+   uint32_t size;
+};
+
 /* A raw compute shader buffer bound at set_shader_buffers slot `slot`
  * (not a descriptor-set SSBO). vp_launch uploads `host[0,size)` to device
  * memory and writes its device address into arg[VP_ARG_SSBO_BASE + slot],
@@ -42,8 +47,7 @@ struct vp_ssbo {
 
 /* Run a compiled Vortex compute kernel (.vxbin) on `dev`.
  *
- * `desc_host[0, desc_bytes)` is set 0's descriptor buffer -- an array
- * of struct lp_descriptor the kernel reaches through arg slot 1.
+ * cbufs contains push constants at index 0 and descriptor sets at set+1.
  * `descs[0, num_descs)` (from vp_scan_descriptors) names the buffer
  * descriptors inside it: each is copied to Vortex device memory and
  * its lp_jit_buffer.ptr rewritten to the device address, so the
@@ -64,12 +68,12 @@ struct vp_ssbo {
 bool vp_launch(struct pipe_screen *screen, vx_device_h dev,
                const void *vxbin, size_t vxbin_size,
                vx_module_h *module_io, vx_kernel_h *kernel_io,
-               const void *desc_host, uint32_t desc_bytes,
+               const struct vp_const_buffer cbufs[VP_MAX_CBUFS],
                const struct vp_desc *descs, uint32_t num_descs,
                const struct vp_ssbo *ssbos, uint32_t num_ssbos,
                const uint32_t grid[3], const uint32_t block[3],
                const uint32_t grid_base[3],
-               uint32_t lmem_size, bool has_rtu);
+               uint32_t lmem_size, uint32_t scratch_size, bool has_rtu);
 
 /* The vertex-buffer geometry feeding a VS kernel: the distinct vertex-buffer
  * resources the draw binds, plus the per-attribute layout. Each attribute may

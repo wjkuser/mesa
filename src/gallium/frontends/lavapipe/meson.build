@@ -41,6 +41,9 @@ endif
 
 lvp_deps = []
 lvp_flags = []
+if get_option('vortex-rtu-path') != ''
+  lvp_flags += ['-DVP_HACKRTCORE', '-I' + get_option('vortex-rtu-path') / 'common']
+endif
 
 if with_platform_x11
   lvp_deps += dep_xcb_dri3

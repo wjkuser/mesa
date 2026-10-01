@@ -701,6 +701,12 @@ intrinsic("vortex_rt_cb_ret", src_comp=[1])                  # cb_ret(src[0]=act
 # response.                        action t     attr
 intrinsic("vortex_rt_continue", src_comp=[1,1,1])
 
+# Explicit query handle and candidate/committed attribute banks.
+intrinsic("vortex_rt_event_wait", src_comp=[1], dest_comp=1)
+intrinsic("vortex_rt_action", src_comp=[1,1], dest_comp=1)
+intrinsic("vortex_rt_set", src_comp=[1], indices=[BASE])
+intrinsic("vortex_rt_get_committed", src_comp=[1], dest_comp=1, indices=[BASE])
+
 # Driver independent raytracing helpers
 
 # rt_resume is a helper that that be the first instruction accesing the

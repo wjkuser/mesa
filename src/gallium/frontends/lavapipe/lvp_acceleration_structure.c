@@ -44,10 +44,16 @@ lvp_init_radix_sort(struct lvp_device *device)
       return;
    }
 
+   struct radix_sort_vk_target_config config = lvp_radix_sort_config;
+   unsigned subgroup_size_log2 =
+      util_logbase2(device->physical_device->pscreen->compute_caps.subgroup_sizes);
+   config.histogram.subgroup_size_log2 = subgroup_size_log2;
+   config.prefix.subgroup_size_log2 = subgroup_size_log2;
+   config.scatter.subgroup_size_log2 = subgroup_size_log2;
    device->radix_sort =
       vk_create_radix_sort_u64(lvp_device_to_handle(device),
                                &device->vk.alloc, VK_NULL_HANDLE,
-                               lvp_radix_sort_config);
+                               config);
 
    device->accel_struct_args.radix_sort = device->radix_sort;
 
@@ -669,7 +675,8 @@ const struct vk_acceleration_structure_build_ops accel_struct_ops = {
 VkResult
 lvp_device_init_accel_struct_state(struct lvp_device *device)
 {
-   device->accel_struct_args.subgroup_size = lp_native_vector_width / 32;
+   device->accel_struct_args.subgroup_size =
+      device->physical_device->pscreen->compute_caps.subgroup_sizes;
 
    device->vk.as_build_ops = &accel_struct_ops;
    device->vk.write_buffer_cp = lvp_write_buffer_cp;

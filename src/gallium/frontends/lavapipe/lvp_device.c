@@ -553,20 +553,26 @@ lvp_get_features(const struct lvp_physical_device *pdevice,
 
       /* VK_KHR_ray_tracing_maintenance1 */
       .rayTracingMaintenance1 = true,
+#ifndef VP_HACKRTCORE
       .rayTracingPipelineTraceRaysIndirect2 = true,
+#endif
 
       /* VK_KHR_ray_tracing_pipeline */
       .rayTracingPipeline = true,
       .rayTracingPipelineShaderGroupHandleCaptureReplay = false,
       .rayTracingPipelineShaderGroupHandleCaptureReplayMixed = false,
+#ifndef VP_HACKRTCORE
       .rayTracingPipelineTraceRaysIndirect = true,
+#endif
       .rayTraversalPrimitiveCulling = true,
 
       /* VK_EXT_pipeline_library_group_handles */
       .pipelineLibraryGroupHandles = true,
 
       /* VK_KHR_ray_tracing_position_fetch */
+#ifndef VP_HACKRTCORE
       .rayTracingPositionFetch = true,
+#endif
 
       /* VK_EXT_shader_object */
       .shaderObject = true,

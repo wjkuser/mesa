@@ -10,6 +10,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "pipe/p_state.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -66,10 +67,11 @@ void vp_free_ir(char *ir);
  * reads) and vp_launch (fills argblk[i]):
  *   arg[0]                       -- push constants
  *   arg[1]                       -- set-0 descriptor blob (constant-buffer 1)
- *   arg[2]                       -- compute dispatch base: base_group_x in the
+ *   arg[2..VP_MAX_CBUFS-1]        -- additional descriptor-set buffers
+ *   arg[VP_ARG_GRID_BASE_XY]      -- compute dispatch base: base_group_x in the
  *                                   low 32 bits, base_group_y in the high 32
  *                                   (vkCmdDispatchBase). 0 for a plain dispatch.
- *   arg[3]                       -- compute dispatch base: base_group_z (low 32).
+ *   arg[VP_ARG_GRID_BASE_Z]       -- compute dispatch base: base_group_z (low 32).
  *   arg[VP_ARG_SSBO_BASE + slot] -- data address of a raw compute shader
  *                                   buffer bound at set_shader_buffers slot
  *                                   `slot`. Distinct from the descriptor-set
@@ -77,9 +79,10 @@ void vp_free_ir(char *ir);
  *                                   this is for internal buffers lavapipe binds
  *                                   directly, e.g. the RT trace-ray command
  *                                   buffer read as load_ssbo(imm slot, off). */
-#define VP_ARG_GRID_BASE_XY 2   /* base_group_x | (base_group_y << 32) */
-#define VP_ARG_GRID_BASE_Z  3   /* base_group_z                        */
-#define VP_ARG_SSBO_BASE 4
+#define VP_MAX_CBUFS PIPE_MAX_CONSTANT_BUFFERS
+#define VP_ARG_GRID_BASE_XY VP_MAX_CBUFS
+#define VP_ARG_GRID_BASE_Z  (VP_MAX_CBUFS + 1)
+#define VP_ARG_SSBO_BASE    (VP_MAX_CBUFS + 2)
 #define VP_MAX_SSBO      4
 
 /* The VERTEX stage overlays its own meanings on slots 0-5 (output record
@@ -94,7 +97,8 @@ void vp_free_ir(char *ir);
  * load_ubo / load_ssbo / load_push_constant lowering indexes the table rather
  * than the arg block. 0 for a VS that binds no constant buffers. */
 #define VP_ARG_VS_DESC   (VP_ARG_SSBO_BASE + VP_MAX_SSBO)
-#define VP_ARG_SLOTS     (VP_ARG_VS_DESC + 1)
+#define VP_ARG_SCRATCH   (VP_ARG_VS_DESC + 1)
+#define VP_ARG_SLOTS     (VP_ARG_SCRATCH + 1)
 
 /* Vertex-attribute table (VS arg slot 1): one entry per VS input
  * driver_location, holding { device base, stride, divisor, - }. The attribute

@@ -363,13 +363,15 @@ vp_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
          }
          vp->startup_fs_owner = cso;
          vp->startup_fs_is_compute = true;
+         struct vp_const_buffer cbufs[VP_MAX_CBUFS] = { 0 };
+         cbufs[1].host = (uint8_t *)desc_host + vp->cbuf_off[1];
+         cbufs[1].size = desc_bytes;
          ran_on_vortex = vp_launch(pipe->screen, vp->dev, cso->vxbin, cso->vxbin_size,
                                    &cso->vx_module, &cso->vx_kernel,
-                                   (uint8_t *)desc_host + vp->cbuf_off[1],
-                                   desc_bytes, cso->descs, cso->num_descs,
+                                   cbufs, cso->descs, cso->num_descs,
                                    ssbos, num_ssbos,
                                    eff_grid, eff_block, info->grid_base,
-                                   cso->lmem_size,
+                                   cso->lmem_size, 0,
                                    vps && vps->has_rtu);
          for (unsigned s = 0; s < VP_MAX_SSBO; s++)
             if (sxfer[s])

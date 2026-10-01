@@ -107,6 +107,20 @@ option(
 )
 
 option(
+  'vortex-graphics',
+  type : 'boolean',
+  value : true,
+  description : 'Build Vortex rasterization and texture SDK integration.',
+)
+
+option(
+  'vortex-rtu-path',
+  type : 'string',
+  value : '',
+  description : 'Path to the HackRTCore RTU source directory.',
+)
+
+option(
   'vortex-tooldir',
   type : 'string',
   value : '',

@@ -16,8 +16,14 @@
 
 #define _GNU_SOURCE
 #include "vp_launch.h"
+#include "vp_memory.h"
 #include "vp_private.h"        /* vp_screen_resident_addr */
-#include "gfx_fs_desc_abi.h"     /* GFX_FS_DESC_SLOTS (VS constant-buffer table) */
+#ifdef VP_HACKRTCORE
+#include "vp_scene.h"
+#endif
+#ifndef VP_COMPUTE_ONLY
+#include "gfx_fs_desc_abi.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -160,6 +166,7 @@ vp_copy_as(struct vp_as_ctx *c, const void *bvh_host)
    return dev_addr;
 }
 
+#ifndef VP_HACKRTCORE
 /* ── BVH transcode: lavapipe lvp_bvh → Vortex RTU scene ──────────────
  * The RTU walks its own scene format (sim/simx/rtu/rtu_types.h), not the
  * lvp_bvh layout. We collect the acceleration structure's opaque triangles
@@ -578,11 +585,17 @@ vp_build_bvh4_scene(const struct vp_tri_list *tl, uint32_t *out_size)
    return scene;
 }
 
+#endif
+
 /* Transcode the lavapipe AS at `tlas_host` into an RTU CW-BVH4 scene in
  * device memory; returns its device address (0 on failure). */
 static uint64_t
 vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
 {
+#ifdef VP_HACKRTCORE
+   uint32_t size = 0;
+   uint8_t *scene = vp_build_scene(tlas_host, &size);
+#else
    struct vp_tri_list tl = { .ok = true };
    static const float kIdentity[12] = { 1,0,0,0, 0,1,0,0, 0,0,1,0 };
    uint32_t root = LVP_BVH_HEADER_SIZE | LVP_NODE_INTERNAL;
@@ -597,6 +610,7 @@ vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
    uint32_t size = 0;
    uint8_t *scene = vp_build_bvh4_scene(&tl, &size);
    free(tl.tris); free(tl.prim); free(tl.geom);
+#endif
    if (!scene) { c->ok = false; return 0; }
 
    if (c->n_bufs >= VP_MAX_BVH || c->n_stages >= VP_MAX_BVH) {
@@ -680,18 +694,19 @@ bool
 vp_launch(struct pipe_screen *screen, vx_device_h dev,
           const void *vxbin, size_t vxbin_size,
           vx_module_h *module_io, vx_kernel_h *kernel_io,
-          const void *desc_host, uint32_t desc_bytes,
+          const struct vp_const_buffer cbufs[VP_MAX_CBUFS],
           const struct vp_desc *descs, uint32_t num_descs,
           const struct vp_ssbo *ssbos, uint32_t num_ssbos,
           const uint32_t grid[3], const uint32_t block[3],
           const uint32_t grid_base[3],
-          uint32_t lmem_size, bool has_rtu)
+          uint32_t lmem_size, uint32_t scratch_size, bool has_rtu)
 {
    bool ok = false;
    vx_queue_h  q    = NULL;
    vx_module_h kmod = NULL;
    vx_kernel_h kbuf = NULL;
    vx_buffer_h dbuf = NULL;
+   vx_buffer_h scratch = NULL;
    /* Resident device buffers are owned by the screen and outlive the dispatch,
     * so these are borrowed handles -- released here they would be freed out
     * from under the next dispatch that resolves to the same host range. */
@@ -706,15 +721,22 @@ vp_launch(struct pipe_screen *screen, vx_device_h dev,
    struct vp_as_ctx asc = { .ok = true };       /* acceleration-structure BVHs */
    uint8_t    *stage = NULL;
 
-   /* A private copy of the descriptor buffer: vp_launch rewrites the
-    * resource pointers inside it to device addresses. It must outlive
-    * vx_queue_finish (vx_enqueue_write reads it asynchronously). */
-   stage = malloc(desc_bytes);
-   if (!stage) {
-      mesa_loge("vortexpipe: launch: descriptor staging OOM");
-      return false;
+   uint32_t offsets[VP_MAX_CBUFS];
+   uint32_t desc_bytes = 0;
+   for (unsigned i = 0; i < VP_MAX_CBUFS; i++) {
+      offsets[i] = desc_bytes;
+      desc_bytes += (cbufs[i].size + 15u) & ~15u;
    }
-   memcpy(stage, desc_host, desc_bytes);
+   if (desc_bytes) {
+      stage = calloc(1, desc_bytes);
+      if (!stage) {
+         mesa_loge("vortexpipe: launch: constant-buffer staging OOM");
+         return false;
+      }
+      for (unsigned i = 0; i < VP_MAX_CBUFS; i++)
+         if (cbufs[i].size)
+            memcpy(stage + offsets[i], cbufs[i].host, cbufs[i].size);
+   }
 
    vx_queue_info_t qi = {
       .struct_size = sizeof(qi), .next = NULL,
@@ -747,7 +769,7 @@ vp_launch(struct pipe_screen *screen, vx_device_h dev,
     *  - VP_DESC_IMAGE: copy the storage image into device memory,
     *    rewrite lp_jit_image.base, read back after the launch. */
    for (uint32_t i = 0; i < num_descs; i++) {
-      uint8_t *slot = stage + descs[i].offset;
+      uint8_t *slot = stage + offsets[descs[i].cbuf_index] + descs[i].offset;
 
       if (descs[i].kind == VP_DESC_AS) {
          uint64_t tlas_host = 0;
@@ -847,19 +869,32 @@ vp_launch(struct pipe_screen *screen, vx_device_h dev,
    }
 
    /* upload the relocated descriptor buffer */
-   VP_CHECK(vx_buffer_create(dev, desc_bytes, 0, &dbuf),
-            "vx_buffer_create(descriptors)");
    uint64_t desc_dev = 0;
-   VP_CHECK(vx_buffer_address(dbuf, &desc_dev), "vx_buffer_address(descriptors)");
-   VP_CHECK(vx_enqueue_write(q, dbuf, 0, stage, desc_bytes, 0, NULL, NULL),
-            "vx_enqueue_write(descriptors)");
+   if (desc_bytes) {
+      VP_CHECK(vx_buffer_create(dev, desc_bytes, 0, &dbuf),
+               "vx_buffer_create(descriptors)");
+      VP_CHECK(vx_buffer_address(dbuf, &desc_dev), "vx_buffer_address(descriptors)");
+      VP_CHECK(vx_enqueue_write(q, dbuf, 0, stage, desc_bytes, 0, NULL, NULL),
+               "vx_enqueue_write(descriptors)");
+   }
 
    /* arg block: i64[VP_ARG_SLOTS]; slot 1 -> set-0 descriptor buffer.
     * In the current vortex2 API the runtime stages the arg blob into a
     * scratch slot at launch time — we pass it inline via args_host
     * instead of allocating an args buffer. */
    uint64_t argblk[VP_ARG_SLOTS] = { 0 };
-   argblk[1] = desc_dev;
+   if (scratch_size) {
+      uint64_t nt, nw, nc;
+      VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_THREADS, &nt), "scratch threads");
+      VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_WARPS, &nw), "scratch warps");
+      VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_CORES, &nc), "scratch cores");
+      VP_CHECK(vx_buffer_create(dev, scratch_size * nt * nw * nc, 0, &scratch),
+               "allocate shader scratch");
+      VP_CHECK(vx_buffer_address(scratch, &argblk[VP_ARG_SCRATCH]), "scratch address");
+   }
+   for (unsigned i = 0; i < VP_MAX_CBUFS; i++)
+      if (cbufs[i].size)
+         argblk[i] = desc_dev + offsets[i];
    /* vkCmdDispatchBase base offset -> gl_WorkGroupID (added in-shader). */
    if (grid_base) {
       argblk[VP_ARG_GRID_BASE_XY] = (uint64_t)grid_base[0]
@@ -924,6 +959,7 @@ vp_launch(struct pipe_screen *screen, vx_device_h dev,
    }
 
    /* dispatch */
+   VP_CHECK(vp_memory_transfer(screen, q, false), "upload device-address allocations");
    uint32_t ndim = (grid[2] > 1 || block[2] > 1) ? 3
                  : (grid[1] > 1 || block[1] > 1) ? 2 : 1;
    vx_launch_info_t li = {
@@ -944,6 +980,7 @@ vp_launch(struct pipe_screen *screen, vx_device_h dev,
       VP_CHECK(vx_enqueue_read(q, res_host[i], res[i], res_off[i], res_bytes[i],
                                0, NULL, NULL), "vx_enqueue_read(resource)");
    }
+   VP_CHECK(vp_memory_transfer(screen, q, true), "read device-address allocations");
    VP_CHECK(vx_queue_finish(q, VX_TIMEOUT_INFINITE), "vx_queue_finish");
 
    ok = true;
@@ -960,6 +997,7 @@ done:
    for (unsigned i = 0; i < asc.n_stages; i++)
       free(asc.stages[i]);
    if (dbuf) vx_buffer_release(dbuf);
+   if (scratch) vx_buffer_release(scratch);
    /* kbuf aliases *kernel_io and stays resident; the caller releases it. */
    if (q)    vx_queue_release(q);
    free(stage);
@@ -970,6 +1008,7 @@ done:
  * layout itself is VP_ATTR_ENTRY_WORDS, shared with the fetch lowering. */
 #define VP_ATTR_TABLE_LOCS  8
 
+#ifndef VP_COMPUTE_ONLY
 bool
 vp_launch_vs(struct pipe_screen *screen, vx_device_h dev,
              const void *vxbin, size_t vxbin_size,
@@ -1197,3 +1236,4 @@ done:
    if (q) vx_queue_release(q);
    return ok;
 }
+#endif
