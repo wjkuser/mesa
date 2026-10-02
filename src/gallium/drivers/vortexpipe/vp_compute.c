@@ -188,7 +188,9 @@ static void launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *
                               &cso->vx_module, &cso->vx_kernel,
                               cbufs, cso->descs, cso->num_descs,
                               ssbos, count, grid, info->block, info->grid_base,
-                              cso->lmem_size, cso->scratch_size, screen->has_rtu);
+                              cso->lmem_size,
+                              cso->scratch_size + info->variable_private_mem,
+                              screen->has_rtu);
    for (unsigned i = 0; i < VP_MAX_CBUFS; i++)
       if (maps[i])
          pipe_buffer_unmap(pipe, maps[i]);

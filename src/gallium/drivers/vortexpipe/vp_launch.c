@@ -883,6 +883,7 @@ vp_launch(struct pipe_screen *screen, vx_device_h dev,
     * scratch slot at launch time — we pass it inline via args_host
     * instead of allocating an args buffer. */
    uint64_t argblk[VP_ARG_SLOTS] = { 0 };
+   argblk[VP_ARG_SCRATCH_STRIDE] = scratch_size;
    if (scratch_size) {
       uint64_t nt, nw, nc;
       VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_THREADS, &nt), "scratch threads");
@@ -932,8 +933,7 @@ vp_launch(struct pipe_screen *screen, vx_device_h dev,
             uint64_t rsize;
             memcpy(&haddr, cmd_copy[slot] + sbt[r].addr_off, sizeof haddr);
             memcpy(&rsize, cmd_copy[slot] + sbt[r].size_off, sizeof rsize);
-            if (!haddr || !rsize || rsize > (1u << 20) ||
-                n_sbt >= VP_MAX_SSBO * 4)
+            if (!haddr || !rsize)
                continue;
             vx_buffer_h *rb = &sbt_res[n_sbt++];
             VP_CHECK(vx_buffer_create(dev, (uint32_t)rsize, 0, rb),

@@ -209,6 +209,10 @@ lvp_compile_ray_tracing_stages(struct lvp_pipeline *pipeline,
       VK_FROM_HANDLE(lvp_pipeline, library, create_info->pLibraryInfo->pLibraries[library_index]);
       for (uint32_t stage_index = 0; stage_index < library->rt.stage_count; stage_index++) {
          lvp_pipeline_nir_ref(pipeline->rt.stages + i, library->rt.stages[stage_index]);
+         if (pipeline->layout) {
+            gl_shader_stage stage = pipeline->rt.stages[i]->nir->info.stage;
+            pipeline->shaders[stage].push_constant_size = pipeline->layout->push_constant_size;
+         }
          i++;
       }
    }
@@ -302,8 +306,15 @@ struct lvp_rt_function {
    nir_shader *stage;
    nir_function *function;
    unsigned trace_depth;
-   unsigned call_depth;
    nir_shader *ahit;
+   unsigned resume_base;
+};
+
+struct lvp_callable_stage {
+   nir_shader *stage;
+   nir_shader **resumes;
+   unsigned resume_count;
+   unsigned entry;
 };
 
 struct lvp_ray_tracing_pipeline_compiler {
@@ -314,9 +325,10 @@ struct lvp_ray_tracing_pipeline_compiler {
 
    struct util_dynarray functions;
    unsigned trace_depth;
-   unsigned call_depth;
    unsigned max_trace_depth;
    nir_shader *isec_ahit;
+   struct lvp_callable_stage *callables;
+   nir_variable *callable_pc;
 
    uint32_t raygen_size;
    uint32_t ahit_size;
@@ -391,7 +403,7 @@ lvp_call_ray_tracing_stage(nir_builder *b, struct lvp_ray_tracing_pipeline_compi
    nir_shader *ahit = stage->info.stage == MESA_SHADER_INTERSECTION ? compiler->isec_ahit : NULL;
    util_dynarray_foreach(&compiler->functions, struct lvp_rt_function, entry) {
       if (entry->stage == stage && entry->trace_depth == compiler->trace_depth &&
-          entry->call_depth == compiler->call_depth && entry->ahit == ahit) {
+          entry->ahit == ahit) {
          function = entry->function;
          break;
       }
@@ -431,8 +443,17 @@ lvp_call_ray_tracing_stage(nir_builder *b, struct lvp_ray_tracing_pipeline_compi
       ralloc_free(var_remap);
 
       struct lvp_rt_function entry = {
-         stage, function, compiler->trace_depth, compiler->call_depth, ahit,
+         .stage = stage, .function = function,
+         .trace_depth = compiler->trace_depth, .ahit = ahit,
       };
+      for (unsigned i = 0; i < compiler->pipeline->rt.stage_count; i++) {
+         struct lvp_callable_stage *callable = &compiler->callables[i];
+         if (callable->stage == stage)
+            entry.resume_base = callable->entry + 1;
+         for (unsigned j = 0; j < callable->resume_count; j++)
+            if (callable->resumes[j] == stage)
+               entry.resume_base = callable->entry + 1;
+      }
       util_dynarray_append(&compiler->functions, struct lvp_rt_function, entry);
    }
 
@@ -464,53 +485,82 @@ lvp_call_ray_tracing_stage(nir_builder *b, struct lvp_ray_tracing_pipeline_compi
    return function;
 }
 
+/* Frames contain the caller's base, continuation, shader record and argument.
+ * The compiler-provided scratch offsets occupy the preceding frame body. */
+#define LVP_CALL_FRAME_HEADER_SIZE 32
+
 static void
-lvp_execute_callable(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *compiler,
-                     nir_intrinsic_instr *instr)
+lvp_callable_push(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *compiler,
+                  nir_intrinsic_instr *instr, unsigned stack_size, unsigned resume)
 {
    struct lvp_ray_tracing_state *state = &compiler->state;
-
-   if (compiler->call_depth == 31)
-      return;
-   compiler->call_depth++;
-   nir_def *record = nir_load_var(b, state->shader_record_ptr);
-   nir_def *argument = nir_load_var(b, state->shader_call_data_offset);
-
-   nir_def *sbt_index = instr->src[0].ssa;
-   nir_def *payload = instr->src[1].ssa;
-
+   nir_def *base = nir_load_var(b, state->stack_ptr);
+   nir_def *header = nir_iadd_imm(b, base, ALIGN(stack_size, 16));
+   nir_store_scratch(b, nir_vec2(b, base, nir_imm_int(b, resume)), header,
+                     .align_mul = 4, .write_mask = 3);
+   nir_store_scratch(b, nir_load_var(b, state->shader_record_ptr),
+                     nir_iadd_imm(b, header, 8), .align_mul = 8, .write_mask = 1);
+   nir_store_scratch(b, nir_load_var(b, state->shader_call_data_offset),
+                     nir_iadd_imm(b, header, 16), .align_mul = 4, .write_mask = 1);
+   nir_def *next = nir_iadd_imm(b, header, LVP_CALL_FRAME_HEADER_SIZE);
+   nir_store_var(b, state->stack_ptr, next, 1);
+   nir_store_var(b, state->shader_call_data_offset,
+                 nir_isub(b, nir_iadd(b, base, instr->src[1].ssa), next), 1);
    struct lvp_sbt_entry callable_entry = lvp_load_sbt_entry(
-      b,
-      sbt_index,
+      b, instr->src[0].ssa,
       offsetof(VkTraceRaysIndirectCommand2KHR, callableShaderBindingTableAddress),
       offsetof(struct lvp_ray_tracing_group_handle, index));
-   nir_store_var(b, compiler->state.shader_record_ptr, callable_entry.shader_record_ptr, 0x1);
-
-   uint32_t stack_size =
-      lvp_ray_tracing_pipeline_compiler_get_stack_size(compiler, b->impl->function);
-   nir_def *stack_ptr = nir_load_var(b, state->stack_ptr);
-   nir_store_var(b, state->stack_ptr, nir_iadd_imm(b, stack_ptr, stack_size), 0x1);
-
-   nir_store_var(b, state->shader_call_data_offset, nir_iadd_imm(b, payload, -stack_size), 0x1);
-
+   nir_store_var(b, state->shader_record_ptr, callable_entry.shader_record_ptr, 1);
    for (uint32_t i = 0; i < compiler->pipeline->rt.group_count; i++) {
       struct lvp_ray_tracing_group *group = compiler->pipeline->rt.groups + i;
       if (group->recursive_index == VK_SHADER_UNUSED_KHR)
          continue;
-
-      nir_shader *stage = compiler->pipeline->rt.stages[group->recursive_index]->nir;
-      if (stage->info.stage != MESA_SHADER_CALLABLE)
+      struct lvp_callable_stage *callable = &compiler->callables[group->recursive_index];
+      if (!callable->stage)
          continue;
-
       nir_push_if(b, nir_ieq_imm(b, callable_entry.value, group->handle.index));
-      lvp_call_ray_tracing_stage(b, compiler, stage);
+      nir_store_var(b, compiler->callable_pc, nir_imm_int(b, callable->entry), 1);
       nir_pop_if(b, NULL);
    }
+}
 
-   nir_store_var(b, state->stack_ptr, stack_ptr, 0x1);
-   nir_store_var(b, state->shader_record_ptr, record, 1);
-   nir_store_var(b, state->shader_call_data_offset, argument, 1);
-   compiler->call_depth--;
+static void
+lvp_callable_pop(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *compiler)
+{
+   struct lvp_ray_tracing_state *state = &compiler->state;
+   nir_def *header = nir_iadd_imm(b, nir_load_var(b, state->stack_ptr), -LVP_CALL_FRAME_HEADER_SIZE);
+   nir_def *saved = nir_load_scratch(b, 2, 32, header, .align_mul = 4);
+   nir_store_var(b, state->shader_record_ptr,
+                 nir_load_scratch(b, 1, 64, nir_iadd_imm(b, header, 8), .align_mul = 8), 1);
+   nir_store_var(b, state->shader_call_data_offset,
+                 nir_load_scratch(b, 1, 32, nir_iadd_imm(b, header, 16), .align_mul = 4), 1);
+   nir_store_var(b, state->stack_ptr, nir_channel(b, saved, 0), 1);
+   nir_store_var(b, compiler->callable_pc, nir_channel(b, saved, 1), 1);
+}
+
+static void
+lvp_execute_callable(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *compiler,
+                     nir_intrinsic_instr *instr)
+{
+   unsigned size = lvp_ray_tracing_pipeline_compiler_get_stack_size(compiler, b->impl->function);
+   lvp_callable_push(b, compiler, instr, size, 0);
+   nir_push_loop(b);
+   nir_def *pc = nir_load_var(b, compiler->callable_pc);
+   nir_push_if(b, nir_ieq_imm(b, pc, 0));
+   nir_jump(b, nir_jump_break);
+   nir_pop_if(b, NULL);
+   for (unsigned i = 0; i < compiler->pipeline->rt.stage_count; i++) {
+      struct lvp_callable_stage *callable = &compiler->callables[i];
+      if (!callable->stage)
+         continue;
+      for (unsigned j = 0; j <= callable->resume_count; j++) {
+         nir_push_if(b, nir_ieq_imm(b, pc, callable->entry + j));
+         lvp_call_ray_tracing_stage(b, compiler,
+                                   j ? callable->resumes[j - 1] : callable->stage);
+         nir_pop_if(b, NULL);
+      }
+   }
+   nir_pop_loop(b, NULL);
 }
 
 struct lvp_lower_isec_intrinsic_state {
@@ -1125,11 +1175,12 @@ lvp_lower_ray_tracing_instr(nir_builder *b, nir_instr *instr, void *data)
    struct lvp_ray_tracing_pipeline_compiler *compiler = data;
    struct lvp_ray_tracing_state *state = &compiler->state;
 
-   compiler->trace_depth = compiler->call_depth = 0;
+   compiler->trace_depth = 0;
+   unsigned resume_base = 0;
    util_dynarray_foreach(&compiler->functions, struct lvp_rt_function, entry) {
       if (entry->function == b->impl->function) {
          compiler->trace_depth = entry->trace_depth;
-         compiler->call_depth = entry->call_depth;
+         resume_base = entry->resume_base;
          break;
       }
    }
@@ -1153,6 +1204,15 @@ lvp_lower_ray_tracing_instr(nir_builder *b, nir_instr *instr, void *data)
 
    switch (intr->intrinsic) {
    /* Ray tracing instructions */
+   case nir_intrinsic_rt_execute_callable:
+      lvp_callable_push(b, compiler, intr, nir_intrinsic_stack_size(intr),
+                        resume_base + nir_intrinsic_call_idx(intr));
+      break;
+   case nir_intrinsic_rt_resume:
+      break;
+   case nir_intrinsic_rt_return_amd:
+      lvp_callable_pop(b, compiler);
+      break;
    case nir_intrinsic_execute_callable:
       lvp_execute_callable(b, compiler, intr);
       break;
@@ -1347,6 +1407,33 @@ lvp_compile_ray_tracing_pipeline(struct lvp_pipeline *pipeline,
    };
    lvp_ray_tracing_state_init(b->shader, &compiler.state);
    util_dynarray_init(&compiler.functions, NULL);
+   compiler.callable_pc = nir_variable_create(b->shader, nir_var_shader_temp,
+                                              glsl_uint_type(), "callable_pc");
+   compiler.callables = calloc(pipeline->rt.stage_count, sizeof(*compiler.callables));
+   unsigned next_entry = 1;
+   for (unsigned i = 0; i < pipeline->rt.stage_count; i++) {
+      nir_shader *stage = pipeline->rt.stages[i]->nir;
+      if (stage->info.stage != MESA_SHADER_CALLABLE)
+         continue;
+      struct lvp_callable_stage *callable = &compiler.callables[i];
+      callable->stage = nir_shader_clone(NULL, stage);
+      /* Merge ordinary source-language returns before appending the shader
+       * return; call suspension will be introduced by the common NIR pass. */
+      NIR_PASS(_, callable->stage, nir_lower_returns);
+      nir_builder cb = nir_builder_at(nir_after_impl(nir_shader_get_entrypoint(callable->stage)));
+      nir_rt_return_amd(&cb);
+      const nir_lower_shader_calls_options options = {
+         .address_format = nir_address_format_32bit_offset,
+         .stack_alignment = 16,
+         .localized_loads = true,
+      };
+      nir_lower_shader_calls(callable->stage, &options, &callable->resumes,
+                             &callable->resume_count, callable->stage);
+      callable->entry = next_entry;
+      next_entry += 1 + callable->resume_count;
+      pipeline->rt.stage_stack_sizes[i] = ALIGN(callable->stage->scratch_size, 16) + LVP_CALL_FRAME_HEADER_SIZE;
+      compiler.callable_size = MAX2(compiler.callable_size, pipeline->rt.stage_stack_sizes[i]);
+   }
 
    nir_def *launch_id = nir_load_ray_launch_id(b);
    nir_def *launch_size = nir_load_ray_launch_size(b);
@@ -1403,11 +1490,11 @@ lvp_compile_ray_tracing_pipeline(struct lvp_pipeline *pipeline,
    NIR_PASS(_, b->shader, nir_shader_intrinsics_pass, lvp_lower_ray_tracing_stack_base,
             nir_metadata_control_flow, NULL);
 
-   /* We can not support dynamic stack sizes, assume the worst. */
-   b->shader->scratch_size +=
+   pipeline->rt.stack_size =
       compiler.raygen_size +
       MIN2(create_info->maxPipelineRayRecursionDepth, 1) * MAX3(compiler.chit_size, compiler.miss_size, compiler.isec_size + compiler.ahit_size) +
-      MAX2(0, (int)create_info->maxPipelineRayRecursionDepth - 1) * MAX2(compiler.chit_size, compiler.miss_size) + 31 * compiler.callable_size;
+      MAX2(0, (int)create_info->maxPipelineRayRecursionDepth - 1) * MAX2(compiler.chit_size, compiler.miss_size) + 2 * compiler.callable_size;
+   b->shader->scratch_size += pipeline->rt.stack_size;
 
    lvp_shader_optimize(b->shader);
 
@@ -1416,6 +1503,9 @@ lvp_compile_ray_tracing_pipeline(struct lvp_pipeline *pipeline,
    shader->shader_cso = lvp_shader_compile(pipeline->device, shader, nir_shader_clone(NULL, shader->pipeline_nir->nir), false);
 
    util_dynarray_fini(&compiler.functions);
+   for (unsigned i = 0; i < pipeline->rt.stage_count; i++)
+      ralloc_free(compiler.callables[i].stage);
+   free(compiler.callables);
 }
 
 static VkResult
@@ -1445,6 +1535,13 @@ lvp_create_ray_tracing_pipeline(VkDevice _device, const VkAllocationCallbacks *a
 
    pipeline->rt.stage_count = create_info->stageCount;
    pipeline->rt.group_count = create_info->groupCount;
+   if (create_info->pDynamicState) {
+      for (uint32_t i = 0; i < create_info->pDynamicState->dynamicStateCount; i++) {
+         if (create_info->pDynamicState->pDynamicStates[i] ==
+             VK_DYNAMIC_STATE_RAY_TRACING_PIPELINE_STACK_SIZE_KHR)
+            pipeline->rt.dynamic_stack_size = true;
+      }
+   }
    if (create_info->pLibraryInfo) {
       for (uint32_t i = 0; i < create_info->pLibraryInfo->libraryCount; i++) {
          VK_FROM_HANDLE(lvp_pipeline, library, create_info->pLibraryInfo->pLibraries[i]);
@@ -1463,6 +1560,14 @@ lvp_create_ray_tracing_pipeline(VkDevice _device, const VkAllocationCallbacks *a
    result = lvp_compile_ray_tracing_stages(pipeline, create_info);
    if (result != VK_SUCCESS)
       goto fail;
+
+   pipeline->rt.stage_stack_sizes = calloc(pipeline->rt.stage_count, sizeof(uint32_t));
+   if (!pipeline->rt.stage_stack_sizes) {
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      goto fail;
+   }
+   for (unsigned i = 0; i < pipeline->rt.stage_count; i++)
+      pipeline->rt.stage_stack_sizes[i] = pipeline->rt.stages[i]->nir->scratch_size;
 
    lvp_init_ray_tracing_groups(pipeline, create_info);
 
@@ -1555,5 +1660,24 @@ lvp_GetRayTracingShaderGroupStackSizeKHR(
    uint32_t group,
    VkShaderGroupShaderKHR groupShader)
 {
-   return 4;
+   VK_FROM_HANDLE(lvp_pipeline, rt_pipeline, pipeline);
+   const struct lvp_ray_tracing_group *shader_group = rt_pipeline->rt.groups + group;
+   uint32_t stage_index;
+   switch (groupShader) {
+   case VK_SHADER_GROUP_SHADER_GENERAL_KHR:
+      stage_index = shader_group->recursive_index;
+      break;
+   case VK_SHADER_GROUP_SHADER_CLOSEST_HIT_KHR:
+      stage_index = shader_group->recursive_index;
+      break;
+   case VK_SHADER_GROUP_SHADER_ANY_HIT_KHR:
+      stage_index = shader_group->ahit_index;
+      break;
+   case VK_SHADER_GROUP_SHADER_INTERSECTION_KHR:
+      stage_index = shader_group->isec_index;
+      break;
+   default:
+      unreachable("Invalid ray tracing shader group selection");
+   }
+   return rt_pipeline->rt.stage_stack_sizes[stage_index];
 }

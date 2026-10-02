@@ -561,9 +561,7 @@ lvp_get_features(const struct lvp_physical_device *pdevice,
       .rayTracingPipeline = true,
       .rayTracingPipelineShaderGroupHandleCaptureReplay = false,
       .rayTracingPipelineShaderGroupHandleCaptureReplayMixed = false,
-#ifndef VP_HACKRTCORE
       .rayTracingPipelineTraceRaysIndirect = true,
-#endif
       .rayTraversalPrimitiveCulling = true,
 
       /* VK_EXT_pipeline_library_group_handles */

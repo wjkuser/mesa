@@ -329,10 +329,8 @@ vp_finalize_nir(struct pipe_screen *screen, struct nir_shader *nir)
       NIR_PASS(_, nir, nir_opt_copy_prop_vars);
       nir_remove_non_entrypoints(nir);
    }
-   /* The megashader keeps its shader-call stack, hit attributes and payload in
-    * scratch; promote indexable scratch to SSA/vars where possible (after
-    * inlining, so callee scratch is covered) to keep the shader on device. */
-   NIR_PASS(_, nir, nir_lower_scratch_to_var);
+   /* Scratch includes the dynamically sized shader-call stack. Keep those
+    * accesses in the per-invocation allocation supplied at dispatch. */
    if (vps && vps->has_rtu)
       vp_nir_lower_ray_tracing_to_rtu(nir);
 

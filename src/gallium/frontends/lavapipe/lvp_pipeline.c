@@ -97,6 +97,7 @@ lvp_pipeline_destroy(struct lvp_device *device, struct lvp_pipeline *pipeline, b
 
    free(pipeline->rt.stages);
    free(pipeline->rt.groups);
+   free(pipeline->rt.stage_stack_sizes);
 
    vk_free(&device->vk.alloc, pipeline->state_data);
    vk_object_base_finish(&pipeline->base);

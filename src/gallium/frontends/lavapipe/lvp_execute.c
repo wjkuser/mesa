@@ -110,6 +110,8 @@ struct rendering_state {
 
    struct pipe_grid_info dispatch_info;
    struct pipe_grid_info trace_rays_info;
+   struct lvp_pipeline *ray_tracing_pipeline;
+   uint32_t ray_tracing_stack_size;
    struct pipe_framebuffer_state framebuffer;
    int fb_map[PIPE_MAX_COLOR_BUFS];
    bool fb_remapped;
@@ -532,6 +534,7 @@ static void handle_ray_tracing_pipeline(struct vk_cmd_queue_entry *cmd,
                                     struct rendering_state *state)
 {
    LVP_FROM_HANDLE(lvp_pipeline, pipeline, cmd->u.bind_pipeline.pipeline);
+   state->ray_tracing_pipeline = pipeline;
 
    struct lvp_shader *shader = &pipeline->shaders[MESA_SHADER_RAYGEN];
 
@@ -4527,6 +4530,10 @@ handle_write_acceleration_structures_properties(struct vk_cmd_queue_entry *cmd, 
 
 static void emit_ray_tracing_state(struct rendering_state *state)
 {
+   const struct lvp_pipeline *pipeline = state->ray_tracing_pipeline;
+   state->trace_rays_info.variable_private_mem =
+      pipeline->rt.dynamic_stack_size && state->ray_tracing_stack_size > pipeline->rt.stack_size
+      ? state->ray_tracing_stack_size - pipeline->rt.stack_size : 0;
    bool pcbuf_dirty = state->pcbuf_dirty[MESA_SHADER_RAYGEN];
    if (pcbuf_dirty)
       update_pcbuf(state, MESA_SHADER_COMPUTE, MESA_SHADER_RAYGEN);
@@ -5284,6 +5291,8 @@ static void lvp_execute_cmd_buffer(struct list_head *cmds,
          handle_write_acceleration_structures_properties(cmd, state);
          break;
       case VK_CMD_SET_RAY_TRACING_PIPELINE_STACK_SIZE_KHR:
+         state->ray_tracing_stack_size =
+            cmd->u.set_ray_tracing_pipeline_stack_size_khr.pipeline_stack_size;
          break;
       case VK_CMD_TRACE_RAYS_INDIRECT2_KHR:
          handle_trace_rays_indirect2(cmd, state);

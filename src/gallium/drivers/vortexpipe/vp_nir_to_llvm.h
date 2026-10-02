@@ -98,7 +98,8 @@ void vp_free_ir(char *ir);
  * than the arg block. 0 for a VS that binds no constant buffers. */
 #define VP_ARG_VS_DESC   (VP_ARG_SSBO_BASE + VP_MAX_SSBO)
 #define VP_ARG_SCRATCH   (VP_ARG_VS_DESC + 1)
-#define VP_ARG_SLOTS     (VP_ARG_SCRATCH + 1)
+#define VP_ARG_SCRATCH_STRIDE (VP_ARG_SCRATCH + 1)
+#define VP_ARG_SLOTS     (VP_ARG_SCRATCH_STRIDE + 1)
 
 /* Vertex-attribute table (VS arg slot 1): one entry per VS input
  * driver_location, holding { device base, stride, divisor, - }. The attribute

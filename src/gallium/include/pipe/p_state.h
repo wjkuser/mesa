@@ -961,6 +961,9 @@ struct pipe_grid_info
     */
    uint32_t variable_shared_mem;
 
+   /** Additional private bytes per invocation, used by dynamic shader stacks. */
+   uint32_t variable_private_mem;
+
    /**
     * Grid number of dimensions, 1-3, e.g. the work_dim parameter passed to
     * clEnqueueNDRangeKernel. Note block[] and grid[] must be padded with

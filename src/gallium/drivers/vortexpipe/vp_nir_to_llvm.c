@@ -1646,9 +1646,13 @@ emit_scratch_base(struct vp_tr *t)
       LLVMValueRef thread = LLVMBuildAdd(t->b,
          LLVMBuildMul(t->b, warp, emit_csr_read(t, VX_CSR_NUM_THREADS, "lanes"), ""),
          emit_csr_read(t, VX_CSR_THREAD_ID, "lane"), "");
+      LLVMValueRef stride_index = LLVMConstInt(t->i32, VP_ARG_SCRATCH_STRIDE, false);
+      LLVMValueRef stride_ptr = LLVMBuildGEP2(t->b, t->i64, t->arg, &stride_index, 1, "");
+      LLVMValueRef stride = LLVMBuildIntCast2(t->b,
+         LLVMBuildLoad2(t->b, t->i64, stride_ptr, "scratch_stride"), t->iptr, false, "");
       LLVMValueRef offset = LLVMBuildMul(t->b,
          LLVMBuildIntCast2(t->b, thread, t->iptr, false, ""),
-         LLVMConstInt(t->iptr, t->scratch_size, false), "");
+         stride, "");
       return LLVMBuildAdd(t->b, base, offset, "scratch");
    }
    if (!t->scratch_base) {

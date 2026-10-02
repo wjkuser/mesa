@@ -539,8 +539,11 @@ struct lvp_pipeline {
    struct {
       struct lvp_pipeline_nir **stages;
       struct lvp_ray_tracing_group *groups;
+      uint32_t *stage_stack_sizes;
       uint32_t stage_count;
       uint32_t group_count;
+      uint32_t stack_size;
+      bool dynamic_stack_size;
    } rt;
 
    unsigned num_groups;
