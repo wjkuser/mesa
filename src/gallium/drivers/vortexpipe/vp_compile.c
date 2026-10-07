@@ -167,7 +167,8 @@ vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
 
    /* Preserve branch-local stores so Vortex split/join regions stay nested. */
    const char *simt_options = "-mllvm -vortex-divergence-max-bbs=65536 "
-                              "-mllvm -simplifycfg-sink-common=false";
+                              "-mllvm -simplifycfg-sink-common=false "
+                              "-funroll-loops -mllvm -unroll-runtime";
    char cache_path[640];
    bool cache_enabled = !getenv("VORTEXPIPE_NO_CACHE");
    cache_path[0] = '\0';
