@@ -693,7 +693,8 @@ intrinsic("rq_load", src_comp=[-1], dest_comp=0, indices=[RAY_QUERY_VALUE,COMMIT
 #                                  scene flags|cull origin dir tmin tmax
 intrinsic("vortex_rt_wtrace", src_comp=[1,1,3,3,1,1], dest_comp=1)  # -> handle
 intrinsic("vortex_rt_wait",  src_comp=[1], dest_comp=1)            # handle -> status
-intrinsic("vortex_rt_get",    src_comp=[1], dest_comp=1, indices=[BASE])
+# Attribute reads leave query state unchanged; retain ordering against RT calls.
+intrinsic("vortex_rt_get",    src_comp=[1], dest_comp=1, indices=[BASE], flags=[CAN_ELIMINATE])
 intrinsic("vortex_rt_cb_ret", src_comp=[1])                  # cb_ret(src[0]=action)
 # Resume traversal for a returned candidate: hands back the per-lane verdict
 # (VX_RT_CB_{ACCEPT,IGNORE,TERMINATE}) with the hit distance and attribute the
@@ -705,7 +706,7 @@ intrinsic("vortex_rt_continue", src_comp=[1,1,1])
 intrinsic("vortex_rt_event_wait", src_comp=[1], dest_comp=1)
 intrinsic("vortex_rt_action", src_comp=[1,1], dest_comp=1)
 intrinsic("vortex_rt_set", src_comp=[1], indices=[BASE])
-intrinsic("vortex_rt_get_committed", src_comp=[1], dest_comp=1, indices=[BASE])
+intrinsic("vortex_rt_get_committed", src_comp=[1], dest_comp=1, indices=[BASE], flags=[CAN_ELIMINATE])
 
 # Driver independent raytracing helpers
 

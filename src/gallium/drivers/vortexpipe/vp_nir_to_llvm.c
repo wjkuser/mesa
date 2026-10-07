@@ -1629,6 +1629,8 @@ emit_atomic_at(struct vp_tr *t, nir_intrinsic_instr *in, LLVMValueRef p,
 static LLVMValueRef
 emit_scratch_base(struct vp_tr *t)
 {
+   if (t->scratch_base)
+      return t->scratch_base;
    if (!t->is_vs && !t->is_fs) {
       LLVMValueRef index = LLVMConstInt(t->i32, VP_ARG_SCRATCH, false);
       LLVMValueRef ptr = LLVMBuildGEP2(t->b, t->i64, t->arg, &index, 1, "");
@@ -1648,7 +1650,8 @@ emit_scratch_base(struct vp_tr *t)
       LLVMValueRef offset = LLVMBuildMul(t->b,
          LLVMBuildIntCast2(t->b, thread, t->iptr, false, ""),
          stride, "");
-      return LLVMBuildAdd(t->b, base, offset, "scratch");
+      t->scratch_base = LLVMBuildAdd(t->b, base, offset, "scratch");
+      return t->scratch_base;
    }
    if (!t->scratch_base) {
       unsigned sz = t->scratch_size ? t->scratch_size : 4u;
@@ -6129,6 +6132,10 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
    if (!t.is_vs && !t.is_fs)
       t.lmem_base = vp_to_iptr(&t,
          emit_csr_read(&t, VX_CSR_CTA_LMEM_ADDR, "lmem"));
+
+   /* Each invocation keeps its scratch allocation throughout the kernel. */
+   if (!t.is_vs && !t.is_fs && t.scratch_size)
+      emit_scratch_base(&t);
 
    nir_foreach_function_impl(impl, nir) {
       t.nval = impl->ssa_alloc;
