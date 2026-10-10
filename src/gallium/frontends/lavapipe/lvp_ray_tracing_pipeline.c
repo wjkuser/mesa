@@ -1498,6 +1498,22 @@ lvp_compile_ray_tracing_pipeline(struct lvp_pipeline *pipeline,
 
    lvp_shader_optimize(b->shader);
 
+#ifdef VP_HACKRTCORE
+   /* A statically bounded TraceRay stack can be promoted after stage inlining.
+    * Callable continuations and application-sized stacks retain scratch. */
+   if (!compiler.callable_size && !pipeline->rt.dynamic_stack_size) {
+      nir_foreach_function(func, b->shader) {
+         if (!func->is_entrypoint)
+            func->should_inline = true;
+      }
+      NIR_PASS(_, b->shader, nir_inline_functions);
+      nir_remove_non_entrypoints(b->shader);
+      NIR_PASS(_, b->shader, nir_opt_copy_prop_vars);
+      NIR_PASS(_, b->shader, nir_lower_scratch_to_var);
+      lvp_shader_optimize(b->shader);
+   }
+#endif
+
    struct lvp_shader *shader = &pipeline->shaders[MESA_SHADER_RAYGEN];
    lvp_shader_init(shader, b->shader);
    shader->shader_cso = lvp_shader_compile(pipeline->device, shader, nir_shader_clone(NULL, shader->pipeline_nir->nir), false);
