@@ -904,6 +904,30 @@ lvp_rtu_instance(nir_builder *b, struct lvp_ray_tracing_state *state,
       lvp_rtu_query_value(b, query, nir_ray_query_value_intersection_instance_sbt_index, committed), 1);
 }
 
+static bool
+lvp_can_keep_traversal_resident(struct lvp_pipeline *pipeline)
+{
+   for (unsigned i = 0; i < pipeline->rt.stage_count; i++) {
+      nir_shader *stage = pipeline->rt.stages[i]->nir;
+      if (stage->info.stage != MESA_SHADER_INTERSECTION &&
+          stage->info.stage != MESA_SHADER_ANY_HIT &&
+          stage->info.stage != MESA_SHADER_CALLABLE)
+         continue;
+      nir_foreach_function_impl(impl, stage) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+               if (op == nir_intrinsic_trace_ray || nir_intrinsic_is_ray_query(op))
+                  return false;
+            }
+         }
+      }
+   }
+   return true;
+}
+
 static void
 lvp_trace_ray_query(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *compiler,
                     nir_def *scene, nir_def *flags, nir_def *mask,
@@ -912,6 +936,7 @@ lvp_trace_ray_query(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *co
    struct lvp_ray_tracing_state *state = &compiler->state;
    nir_variable *variable = nir_local_variable_create(b->impl, glsl_uint_type(), "traversal_query");
    variable->data.ray_query = true;
+   variable->data.rtu_resident_query = lvp_can_keep_traversal_resident(compiler->pipeline);
    nir_def *query = &nir_build_deref_var(b, variable)->def;
    nir_rq_initialize(b, query, scene, flags, mask, origin, tmin, direction, tmax);
    struct lvp_ray_traversal_args args = { .data = compiler };

@@ -2401,6 +2401,9 @@ nir_lower_explicit_io_impl(nir_function_impl *impl, nir_variable_mode modes,
          case nir_instr_type_deref: {
             nir_deref_instr *deref = nir_instr_as_deref(instr);
             if (nir_deref_mode_is_in_set(deref, modes)) {
+               nir_variable *var = nir_deref_instr_get_variable(deref);
+               if (var && var->data.ray_query)
+                  break;
                lower_explicit_io_deref(&b, deref, addr_format);
                progress = true;
             }

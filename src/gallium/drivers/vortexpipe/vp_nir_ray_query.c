@@ -141,6 +141,59 @@ proceed(nir_builder *b, nir_deref_instr *state, nir_def *continuation)
    return nir_ieq_imm(b, load(b, state, Q_PHASE), Q_HAS_CANDIDATE);
 }
 
+static nir_def *
+proceed_resident(nir_builder *b, nir_deref_instr *state)
+{
+   nir_push_if(b, nir_ine_imm(b, load(b, state, Q_PHASE), Q_COMPLETE));
+   nir_push_if(b, nir_ieq_imm(b, load(b, state, Q_PHASE), Q_INITIALIZED));
+   nir_vortex_rt_set(b, nir_imm_int(b, 0), .base = VX_RT_QUERY_CONTEXT);
+   nir_def *flags = nir_ior(b, load(b, state, Q_FLAGS),
+       nir_ishl_imm(b, nir_iand_imm(b, load(b, state, Q_MASK), 255), 16));
+   store(b, state, Q_HANDLE, nir_vortex_rt_wtrace(b, 32,
+       load(b, state, Q_SCENE), flags, load_vector(b, state, Q_ORIGIN, 3),
+       load_vector(b, state, Q_DIRECTION, 3), load(b, state, Q_MIN), load(b, state, Q_MAX)));
+   nir_push_else(b, NULL);
+   nir_vortex_rt_set(b, load(b, state, Q_GENERATED_T), .base = VX_RT_HIT_T);
+   nir_vortex_rt_action(b, 32, load(b, state, Q_HANDLE), load(b, state, Q_ACTION));
+   nir_pop_if(b, NULL);
+   nir_variable *event = nir_local_variable_create(b->impl, glsl_uint_type(), "resident_event");
+   nir_push_loop(b);
+   nir_def *status = nir_vortex_rt_event_wait(b, 32, load(b, state, Q_HANDLE));
+   nir_store_var(b, event, status, 1);
+   nir_break_if(b, nir_ine_imm(b, status, VX_RT_EVENT_PENDING));
+   nir_pop_loop(b, NULL);
+   nir_def *token = nir_load_var(b, event);
+   nir_push_if(b, nir_ieq_imm(b, token, VX_RT_EVENT_COMPLETE));
+   nir_def *terminal = nir_vortex_rt_wait(b, 32, load(b, state, Q_HANDLE));
+   snapshot(b, state, Q_COMMITTED, terminal, false);
+   store(b, state, Q_PHASE, nir_imm_int(b, Q_COMPLETE));
+   nir_push_else(b, NULL);
+   snapshot(b, state, Q_CANDIDATE, token, false);
+   snapshot(b, state, Q_COMMITTED, token, true);
+   store(b, state, Q_PHASE, nir_imm_int(b, Q_HAS_CANDIDATE));
+   store(b, state, Q_ACTION, nir_imm_int(b, VX_RT_ACTION_IGNORE));
+   nir_pop_if(b, NULL);
+   nir_pop_if(b, NULL);
+   return nir_ieq_imm(b, load(b, state, Q_PHASE), Q_HAS_CANDIDATE);
+}
+
+static void
+terminate_resident(nir_builder *b, nir_deref_instr *state)
+{
+   nir_push_if(b, nir_ieq_imm(b, load(b, state, Q_PHASE), Q_HAS_CANDIDATE));
+   nir_def *action = load(b, state, Q_ACTION);
+   action = nir_bcsel(b, nir_ieq_imm(b, action, VX_RT_ACTION_GENERATE),
+      nir_imm_int(b, VX_RT_ACTION_GENERATE_TERMINATE),
+      nir_bcsel(b, nir_ieq_imm(b, action, VX_RT_ACTION_ACCEPT),
+         nir_imm_int(b, VX_RT_ACTION_ACCEPT_TERMINATE), nir_imm_int(b, VX_RT_ACTION_TERMINATE)));
+   nir_vortex_rt_set(b, load(b, state, Q_GENERATED_T), .base = VX_RT_HIT_T);
+   nir_vortex_rt_action(b, 32, load(b, state, Q_HANDLE), action);
+   nir_def *terminal = nir_vortex_rt_wait(b, 32, load(b, state, Q_HANDLE));
+   snapshot(b, state, Q_COMMITTED, terminal, false);
+   nir_pop_if(b, NULL);
+   store(b, state, Q_PHASE, nir_imm_int(b, Q_COMPLETE));
+}
+
 static void
 terminate(nir_builder *b, nir_deref_instr *state)
 {
@@ -266,10 +319,15 @@ vp_nir_lower_ray_tracing_to_rtu(nir_shader *shader)
          switch (in->intrinsic) {
          case nir_intrinsic_rq_initialize: initialize(&b, in, state); break;
          case nir_intrinsic_rq_proceed:
-            result = proceed(&b, state, continuation_address(&b, query,
+            if (var->data.rtu_resident_query)
+               result = proceed_resident(&b, state);
+            else result = proceed(&b, state, continuation_address(&b, query,
                (uintptr_t)_mesa_hash_table_search(continuations, var)->data));
             break;
-         case nir_intrinsic_rq_terminate: terminate(&b, state); break;
+         case nir_intrinsic_rq_terminate:
+            if (var->data.rtu_resident_query) terminate_resident(&b, state);
+            else terminate(&b, state);
+            break;
          case nir_intrinsic_rq_confirm_intersection:
             commit_candidate(&b, state);
             store(&b, state, Q_ACTION, nir_imm_int(&b, VX_RT_ACTION_ACCEPT));

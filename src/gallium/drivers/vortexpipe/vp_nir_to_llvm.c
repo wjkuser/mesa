@@ -3038,23 +3038,33 @@ emit_vx_wgather(struct vp_tr *t, LLVMValueRef self, LLVMValueRef v1,
    return LLVMBuildCall2(t->b, fnty, ia, a, 4, "wgather");
 }
 
-/* vx_rt_get: rd <- hit slot (GETW, funct3=6 funct2=3, count=1; rs2=x1); rs1 =
+/* vx_rt_get: rd <- hit slot (funct3=6, count=1); rs1 =
  * status (scoreboard ordering token so the read stalls until wait's terminal
- * staged the hit). Reads the f32-bit slot into a GP register. */
+ * staged the hit). Float fields use GET_FLOAT directly into the FP bank;
+ * metadata uses GET into the integer bank. */
 static LLVMValueRef
 emit_vx_rt_get(struct vp_tr *t, unsigned slot, LLVMValueRef status)
 {
+   bool floating = false;
+#ifdef VP_HACKRTCORE
+   unsigned field = slot & 31;
+   floating = field == VX_RT_HIT_T || field == VX_RT_HIT_BARY_U ||
+      field == VX_RT_HIT_BARY_V ||
+      (field >= VX_RT_OBJECT_RAY_ORIGIN && field < VX_RT_OBJECT_RAY_ORIGIN + 3) ||
+      (field >= VX_RT_OBJECT_RAY_DIRECTION && field < VX_RT_OBJECT_RAY_DIRECTION + 3);
+#endif
    char s[48];
    int n = snprintf(s, sizeof s, ".insn r 43, 6, %u, $0, $1, x%u",
-                    ((slot & 0x1f) << 2) | 3u, (slot & 32) ? 17 : 1);
+                    ((slot & 0x1f) << 2) | (floating ? 2u : 3u), (slot & 32) ? 17 : 1);
    LLVMTypeRef args[1] = { t->i32 };
-   LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 1, false);
-   const char *constraints = "=r,r,~{memory}";
+   LLVMTypeRef fnty = LLVMFunctionType(floating ? t->f32 : t->i32, args, 1, false);
+   const char *constraints = floating ? "=f,r,~{memory}" : "=r,r,~{memory}";
    LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, (size_t)n, constraints, strlen(constraints),
                                       /*HasSideEffects*/ true, false,
                                       LLVMInlineAsmDialectATT, false);
    LLVMValueRef a[1] = { status };
-   return LLVMBuildCall2(t->b, fnty, ia, a, 1, "rtget");
+   LLVMValueRef value = LLVMBuildCall2(t->b, fnty, ia, a, 1, "rtget");
+   return floating ? LLVMBuildBitCast(t->b, value, t->i32, "") : value;
 }
 
 /* vx_rt_trace: rd = handle <- trace(rs1 = lane-packed config; f0..f7 = ray).
@@ -3126,7 +3136,7 @@ emit_rt_set(struct vp_tr *t, unsigned slot, LLVMValueRef value)
 {
    char assembly[64];
    snprintf(assembly, sizeof assembly, ".insn r 43, 6, %u, x0, $0, x0", (slot << 2) | 1);
-   const char *constraints = "r,~{memory}";
+   const char *constraints = "r";
    LLVMTypeRef args[1] = {t->i32};
    LLVMTypeRef fnty = LLVMFunctionType(LLVMVoidTypeInContext(t->ctx), args, 1, false);
    LLVMValueRef ia = LLVMGetInlineAsm(fnty, assembly, strlen(assembly),
@@ -5839,6 +5849,9 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
       memset(out_vs, 0, sizeof *out_vs);
    if (!nir)
       return false;
+   /* Local storage is emitted as scalar/vector/array allocations. */
+   NIR_PASS(_, nir, nir_split_struct_vars, nir_var_function_temp);
+   NIR_PASS(_, nir, nir_remove_dead_derefs);
 #ifdef VP_COMPUTE_ONLY
    if (nir->info.stage != MESA_SHADER_COMPUTE)
       return false;
