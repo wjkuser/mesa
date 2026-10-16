@@ -348,6 +348,33 @@ emit_fpow(struct vp_tr *t, LLVMValueRef x, LLVMValueRef y)
 
 static LLVMTypeRef cty(struct vp_tr *t, unsigned bits);
 
+static LLVMValueRef
+emit_fminmax(struct vp_tr *t, LLVMValueRef a, LLVMValueRef b, bool maximum)
+{
+   LLVMTypeRef ft = LLVMTypeOf(a);
+   if (ft == t->f32) {
+      const char *assembly = maximum ? "fmax.s $0, $1, $2" : "fmin.s $0, $1, $2";
+      LLVMTypeRef types[] = {ft, ft};
+      LLVMTypeRef type = LLVMFunctionType(ft, types, 2, false);
+      LLVMValueRef fn = LLVMGetInlineAsm(type, assembly, strlen(assembly),
+         "=f,f,f", 6, false, false, LLVMInlineAsmDialectATT, false);
+      LLVMValueRef args[] = {a, b};
+      return LLVMBuildCall2(t->b, type, fn, args, 2, "minmax");
+   }
+
+   /* Preserve NIR's numeric-NaN and signed-zero rules on the soft-float path. */
+   LLVMValueRef selected = LLVMBuildSelect(t->b,
+      LLVMBuildFCmp(t->b, maximum ? LLVMRealOGT : LLVMRealOLT, a, b, ""), a, b, "");
+   LLVMValueRef ai = LLVMBuildBitCast(t->b, a, t->i64, "");
+   LLVMValueRef bi = LLVMBuildBitCast(t->b, b, t->i64, "");
+   LLVMValueRef equal = maximum ? LLVMBuildAnd(t->b, ai, bi, "")
+                                : LLVMBuildOr(t->b, ai, bi, "");
+   selected = LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealOEQ, a, b, ""),
+      LLVMBuildBitCast(t->b, equal, ft, ""), selected, "");
+   return LLVMBuildSelect(t->b, LLVMBuildFCmp(t->b, LLVMRealUNO, b, b, ""),
+      a, selected, "minmax");
+}
+
 /* Width-aware unary float intrinsic (llvm.<base>.f32/f64). `base` is the
  * intrinsic stem without the type suffix ("floor","ceil","trunc","round",
  * "roundeven","exp2","log2","sin","cos"). `fa` is a compute-typed float (from
@@ -573,10 +600,7 @@ emit_scan_combine(struct vp_tr *t, nir_op rop, LLVMValueRef a, LLVMValueRef b)
       LLVMValueRef fr =
          rop == nir_op_fadd ? LLVMBuildFAdd(t->b, fa, fb, "")
        : rop == nir_op_fmul ? LLVMBuildFMul(t->b, fa, fb, "")
-       : rop == nir_op_fmin ? LLVMBuildSelect(t->b,
-            LLVMBuildFCmp(t->b, LLVMRealOLT, fa, fb, ""), fa, fb, "")
-       :                      LLVMBuildSelect(t->b,
-            LLVMBuildFCmp(t->b, LLVMRealOGT, fa, fb, ""), fa, fb, "");
+       : emit_fminmax(t, fa, fb, rop == nir_op_fmax);
       return LLVMBuildBitCast(t->b, fr, t->i32, "");
    }
    default:
@@ -1147,12 +1171,8 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
             LLVMValueRef fb = as_float(t, alu_src(t, alu, 1, c), bs);
             if (alu->op == nir_op_fdiv)
                res = LLVMBuildFDiv(t->b, fa, fb, "");
-            else if (alu->op == nir_op_fmin)
-               res = LLVMBuildSelect(t->b,
-                  LLVMBuildFCmp(t->b, LLVMRealOLT, fa, fb, ""), fa, fb, "");
-            else if (alu->op == nir_op_fmax)
-               res = LLVMBuildSelect(t->b,
-                  LLVMBuildFCmp(t->b, LLVMRealOGT, fa, fb, ""), fa, fb, "");
+            else if (alu->op == nir_op_fmin || alu->op == nir_op_fmax)
+               res = emit_fminmax(t, fa, fb, alu->op == nir_op_fmax);
             else { /* ffma */
                LLVMValueRef fc = as_float(t, alu_src(t, alu, 2, c), bs);
                const char *name = bs == 64 ? "llvm.fma.f64" : "llvm.fma.f32";
