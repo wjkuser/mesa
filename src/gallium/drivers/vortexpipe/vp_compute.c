@@ -82,8 +82,21 @@ static void *create_compute_state(struct pipe_context *pipe,
           nir->info.name ? nir->info.name : "compute");
    vp_scan_descriptors(nir, cso->descs, &cso->num_descs);
    char *ir = NULL;
-   bool ok = vp_nir_to_llvm(nir, &ir, NULL, NULL, 1, 0) &&
-             vp_compile_vxbin(ir, VP_STARTUP_FS, false, &cso->vxbin, &cso->vxbin_size);
+   bool ok = vp_nir_to_llvm(nir, &ir, NULL, NULL, 1, 0);
+   if (ok) {
+      struct vp_screen *screen = vp_reg_get(pipe->screen);
+      /* Fixed-linked images need distinct addresses to remain resident when
+       * dispatches alternate shaders, including across contexts. */
+      simple_mtx_lock(&screen->resident_lock);
+      ok = vp_compile_vxbin(ir, screen->next_program_address, false,
+                            &cso->vxbin, &cso->vxbin_size);
+      if (ok) {
+         uint64_t image_end;
+         memcpy(&image_end, (const char *)cso->vxbin + 8, sizeof(image_end));
+         screen->next_program_address = ALIGN_POT(image_end, 4096);
+      }
+      simple_mtx_unlock(&screen->resident_lock);
+   }
    vp_free_ir(ir);
    ralloc_free(nir);
    if (!ok) {
@@ -96,8 +109,6 @@ static void *create_compute_state(struct pipe_context *pipe,
 static void bind_compute_state(struct pipe_context *pipe, void *state)
 {
    struct vp_context *ctx = vp_reg_get(pipe);
-   if (ctx->cur_cso != state)
-      release_module(ctx->cur_cso);
    ctx->cur_cso = state;
 }
 

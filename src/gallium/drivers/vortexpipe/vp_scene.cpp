@@ -142,6 +142,7 @@ public:
             out.qaabb_max[i][axis] = std::clamp(int(std::ceil((high[i] - origin)/step)), 0, 255);
          }
       }
+      bytes.resize((bytes.size() + sizeof(out) - 1) & ~(sizeof(out) - 1), 0);
       return append(out);
    }
 };

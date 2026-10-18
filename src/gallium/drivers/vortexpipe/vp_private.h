@@ -104,6 +104,7 @@ struct vp_screen {
    unsigned            n_resident;
    unsigned            resident_cap;
    simple_mtx_t        resident_lock;
+   uint64_t            next_program_address;
    void (*lp_resource_destroy)(struct pipe_screen *, struct pipe_resource *);
 };
 

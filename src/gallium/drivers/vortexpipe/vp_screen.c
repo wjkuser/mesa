@@ -19,6 +19,7 @@
 
 #include "vp_public.h"
 #include "vp_private.h"
+#include "vp_compile.h"
 #include "vp_memory.h"
 #include "llvmpipe/lp_public.h"
 #include "llvmpipe/lp_texture.h"   /* struct llvmpipe_resource: a resource's host base */
@@ -569,6 +570,7 @@ vortexpipe_create_screen(struct sw_winsys *winsys)
    simple_mtx_init(&vps->dev_nir_lock, mtx_plain);
 
    simple_mtx_init(&vps->resident_lock, mtx_plain);
+   vps->next_program_address = VP_STARTUP_FS;
 
    /* Open the Vortex device once, held for the screen's lifetime. */
    uint32_t ndev = 0;

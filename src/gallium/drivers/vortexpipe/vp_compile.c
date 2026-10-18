@@ -169,6 +169,7 @@ vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
    const char *simt_options = "-mllvm -vortex-divergence-max-bbs=65536 "
                               "-mllvm -simplifycfg-sink-common=false "
                               "-funroll-loops -mllvm -unroll-runtime "
+                              "-mllvm -enable-post-misched "
                               "-mllvm -riscv-use-rematerializable-movimm";
    char cache_path[640];
    bool cache_enabled = !getenv("VORTEXPIPE_NO_CACHE");
@@ -180,6 +181,16 @@ vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
                linker, libc, libcrt, startup_addr, link_gfx_sw ? 1 : 0);
       uint64_t key = vp_hash(0xcbf29ce484222325ull, cfg, strlen(cfg));
       key = vp_hash(key, llvm_ir, strlen(llvm_ir));
+      char packager_path[1024];
+      snprintf(packager_path, sizeof packager_path, "%s/sw/kernel/scripts/vxbin.py", vh);
+      size_t packager_size;
+      void *packager = read_blob(packager_path, &packager_size);
+      if (!packager) {
+         mesa_loge("vortexpipe: cannot read kernel packager %s", packager_path);
+         return false;
+      }
+      key = vp_hash(key, packager, packager_size);
+      free(packager);
 
       char cdir[512];
       if (vp_cache_dir(cdir, sizeof cdir)) {
