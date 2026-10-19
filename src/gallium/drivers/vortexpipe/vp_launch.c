@@ -699,7 +699,7 @@ vp_launch(struct pipe_screen *screen, vx_device_h dev,
           const struct vp_ssbo *ssbos, uint32_t num_ssbos,
           const uint32_t grid[3], const uint32_t block[3],
           const uint32_t grid_base[3],
-          uint32_t lmem_size, uint32_t scratch_size, bool has_rtu)
+          uint32_t lmem_size, uint32_t scratch_size, bool scratch_private, bool has_rtu)
 {
    bool ok = false;
    vx_queue_h  q    = NULL;
@@ -883,13 +883,15 @@ vp_launch(struct pipe_screen *screen, vx_device_h dev,
     * scratch slot at launch time — we pass it inline via args_host
     * instead of allocating an args buffer. */
    uint64_t argblk[VP_ARG_SLOTS] = { 0 };
+   if (scratch_private) scratch_size = ALIGN(scratch_size, 64);
    argblk[VP_ARG_SCRATCH_STRIDE] = scratch_size;
    if (scratch_size) {
       uint64_t nt, nw, nc;
       VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_THREADS, &nt), "scratch threads");
       VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_WARPS, &nw), "scratch warps");
       VP_CHECK(vx_device_query(dev, VX_CAPS_NUM_CORES, &nc), "scratch cores");
-      VP_CHECK(vx_buffer_create(dev, scratch_size * nt * nw * nc, 0, &scratch),
+      VP_CHECK(vx_buffer_create(dev, scratch_size * nt * nw * nc,
+                               scratch_private ? VX_MEM_PRIVATE : 0, &scratch),
                "allocate shader scratch");
       VP_CHECK(vx_buffer_address(scratch, &argblk[VP_ARG_SCRATCH]), "scratch address");
    }

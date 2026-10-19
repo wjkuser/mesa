@@ -73,7 +73,7 @@ bool vp_launch(struct pipe_screen *screen, vx_device_h dev,
                const struct vp_ssbo *ssbos, uint32_t num_ssbos,
                const uint32_t grid[3], const uint32_t block[3],
                const uint32_t grid_base[3],
-               uint32_t lmem_size, uint32_t scratch_size, bool has_rtu);
+               uint32_t lmem_size, uint32_t scratch_size, bool scratch_private, bool has_rtu);
 
 /* The vertex-buffer geometry feeding a VS kernel: the distinct vertex-buffer
  * resources the draw binds, plus the per-attribute layout. Each attribute may

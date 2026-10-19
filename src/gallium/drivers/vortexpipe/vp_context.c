@@ -371,7 +371,7 @@ vp_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
                                    cbufs, cso->descs, cso->num_descs,
                                    ssbos, num_ssbos,
                                    eff_grid, eff_block, info->grid_base,
-                                   cso->lmem_size, 0,
+                                   cso->lmem_size, 0, false,
                                    vps && vps->has_rtu);
          for (unsigned s = 0; s < VP_MAX_SSBO; s++)
             if (sxfer[s])

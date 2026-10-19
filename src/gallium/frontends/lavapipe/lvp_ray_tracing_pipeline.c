@@ -225,7 +225,7 @@ lvp_load_trace_ray_command_field(nir_builder *b, uint32_t command_offset,
                                  uint32_t num_components, uint32_t bit_size)
 {
    return nir_load_ssbo(b, num_components, bit_size, nir_imm_int(b, 0),
-                        nir_imm_int(b, command_offset));
+                        nir_imm_int(b, command_offset), .access = ACCESS_NON_WRITEABLE);
 }
 
 struct lvp_sbt_entry {
@@ -1033,9 +1033,20 @@ lvp_trace_ray(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *compiler
       state->shader_record_ptr, state->shader_call_data_offset,
       state->accept, state->terminate, state->opaque,
    };
-   nir_def *saved[ARRAY_SIZE(saved_vars)];
-   for (unsigned i = 0; i < ARRAY_SIZE(saved_vars); ++i)
-      saved[i] = nir_load_var(b, saved_vars[i]);
+   /* Raygen has no incoming ray state; retain its record and call data. */
+   bool raygen = false;
+   util_dynarray_foreach(&compiler->functions, struct lvp_rt_function, entry) {
+      if (entry->function == b->impl->function) {
+         raygen = entry->stage->info.stage == MESA_SHADER_RAYGEN;
+         break;
+      }
+   }
+   nir_def *saved[ARRAY_SIZE(saved_vars)] = {0};
+   for (unsigned i = 0; i < ARRAY_SIZE(saved_vars); ++i) {
+      if (!raygen || saved_vars[i] == state->shader_record_ptr ||
+          saved_vars[i] == state->shader_call_data_offset)
+         saved[i] = nir_load_var(b, saved_vars[i]);
+   }
 
    nir_def *accel_struct = instr->src[0].ssa;
    nir_def *flags = instr->src[1].ssa;
@@ -1179,7 +1190,8 @@ lvp_trace_ray(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *compiler
 
    nir_store_var(b, state->stack_ptr, stack_ptr, 0x1);
    for (unsigned i = 0; i < ARRAY_SIZE(saved_vars); ++i)
-      nir_store_var(b, saved_vars[i], saved[i], BITFIELD_MASK(saved[i]->num_components));
+      if (saved[i])
+         nir_store_var(b, saved_vars[i], saved[i], BITFIELD_MASK(saved[i]->num_components));
    compiler->trace_depth--;
 }
 
@@ -1524,8 +1536,7 @@ lvp_compile_ray_tracing_pipeline(struct lvp_pipeline *pipeline,
    lvp_shader_optimize(b->shader);
 
 #ifdef VP_HACKRTCORE
-   /* A statically bounded TraceRay stack can be promoted after stage inlining.
-    * Callable continuations and application-sized stacks retain scratch. */
+   /* Keep cross-stage state in scratch before inlining stage functions. */
    if (!compiler.callable_size && !pipeline->rt.dynamic_stack_size) {
       nir_foreach_function(func, b->shader) {
          if (!func->is_entrypoint)
@@ -1534,7 +1545,6 @@ lvp_compile_ray_tracing_pipeline(struct lvp_pipeline *pipeline,
       NIR_PASS(_, b->shader, nir_inline_functions);
       nir_remove_non_entrypoints(b->shader);
       NIR_PASS(_, b->shader, nir_opt_copy_prop_vars);
-      NIR_PASS(_, b->shader, nir_lower_scratch_to_var);
       lvp_shader_optimize(b->shader);
    }
 #endif

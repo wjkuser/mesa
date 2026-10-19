@@ -181,16 +181,19 @@ vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
                linker, libc, libcrt, startup_addr, link_gfx_sw ? 1 : 0);
       uint64_t key = vp_hash(0xcbf29ce484222325ull, cfg, strlen(cfg));
       key = vp_hash(key, llvm_ir, strlen(llvm_ir));
-      char packager_path[1024];
-      snprintf(packager_path, sizeof packager_path, "%s/sw/kernel/scripts/vxbin.py", vh);
-      size_t packager_size;
-      void *packager = read_blob(packager_path, &packager_size);
-      if (!packager) {
-         mesa_loge("vortexpipe: cannot read kernel packager %s", packager_path);
-         return false;
+      char inputs[2][1024];
+      snprintf(inputs[0], sizeof inputs[0], "%s/sw/kernel/scripts/vxbin.py", vh);
+      snprintf(inputs[1], sizeof inputs[1], "%s/llvm-vortex/lib/libLLVMRISCVCodeGen.so", td);
+      for (unsigned i = 0; i < ARRAY_SIZE(inputs); ++i) {
+         size_t size;
+         void *data = read_blob(inputs[i], &size);
+         if (!data) {
+            mesa_loge("vortexpipe: cannot read compiler input %s", inputs[i]);
+            return false;
+         }
+         key = vp_hash(key, data, size);
+         free(data);
       }
-      key = vp_hash(key, packager, packager_size);
-      free(packager);
 
       char cdir[512];
       if (vp_cache_dir(cdir, sizeof cdir)) {

@@ -7,6 +7,7 @@ struct vp_cso {
    size_t vxbin_size;
    unsigned lmem_size;
    unsigned scratch_size;
+   bool scratch_private;
    struct vp_desc descs[VP_MAX_DESCS];
    unsigned num_descs;
    vx_module_h vx_module;

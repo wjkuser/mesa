@@ -241,6 +241,7 @@ optimizations = [
    (('iadd', a, ('iadd', ('ineg', a), b)), b),
    (('~fadd', ('fneg', a), ('fadd', a, b)), b),
    (('~fadd', a, ('fadd', ('fneg', a), b)), b),
+   (('~fadd', a, ('fneg(nsz,nnan,ninf)', ('fadd(nsz,nnan,ninf)', a, b))), ('fneg', b)),
    (('fadd', ('fsat', a), ('fsat', ('fneg', a))), ('fsat', ('fabs', a))),
    (('fadd', a, a), ('fmul', a, 2.0)),
    (('~fmul', a, 0.0), 0.0),

@@ -78,6 +78,16 @@ static void *create_compute_state(struct pipe_context *pipe,
    }
    cso->lmem_size = nir->info.shared_size;
    cso->scratch_size = nir->scratch_size;
+   cso->scratch_private = true;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_scratch_base_ptr)
+               cso->scratch_private = false;
+         }
+      }
+   }
    vp_dbg("vortexpipe: compile %p: %s", (void *)cso,
           nir->info.name ? nir->info.name : "compute");
    vp_scan_descriptors(nir, cso->descs, &cso->num_descs);
@@ -201,7 +211,7 @@ static void launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *
                               ssbos, count, grid, info->block, info->grid_base,
                               cso->lmem_size,
                               cso->scratch_size + info->variable_private_mem,
-                              screen->has_rtu);
+                              cso->scratch_private, screen->has_rtu);
    for (unsigned i = 0; i < VP_MAX_CBUFS; i++)
       if (maps[i])
          pipe_buffer_unmap(pipe, maps[i]);

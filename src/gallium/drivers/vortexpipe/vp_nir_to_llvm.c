@@ -176,6 +176,7 @@ struct vp_tr {
     * For a deref instr, component 0 holds the iptr byte address. */
    LLVMValueRef  *val;
    unsigned       nval;
+   BITSET_WORD *float_types;
    /* vertex-shader state (is_vs only) */
    bool           is_vs;
    LLVMValueRef   vid;          /* i32 vertex id (index-resolved): gl_VertexIndex
@@ -272,7 +273,12 @@ ssa_get(struct vp_tr *t, unsigned idx, unsigned comp)
 {
    if (idx >= t->nval || comp >= VP_MAXC)
       return NULL;
-   return t->val[idx * VP_MAXC + comp];
+   LLVMValueRef value = t->val[idx * VP_MAXC + comp];
+   if (value && LLVMGetTypeKind(LLVMTypeOf(value)) == LLVMFloatTypeKind)
+      return LLVMBuildBitCast(t->b, value, t->i32, "float_bits");
+   if (value && LLVMGetTypeKind(LLVMTypeOf(value)) == LLVMDoubleTypeKind)
+      return LLVMBuildBitCast(t->b, value, t->i64, "float_bits");
+   return value;
 }
 
 static void
@@ -1972,10 +1978,21 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
             LLVMConstInt(t->i64, c * esz, false), "");
          LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
          LLVMValueRef value = vp_load_mem(t, in->def.bit_size, p, "buf");
-         /* A fixed offset in a fixed constant buffer is shared by the warp.
+         /* Raw slots address private uploads, not descriptor-backed resources
+          * that may alias shader writes. Their contents stay fixed at launch. */
+         if (nir_src_is_const(in->src[0]) &&
+             (in->intrinsic == nir_intrinsic_load_ubo ||
+              ((nir_intrinsic_access(in) & ACCESS_NON_WRITEABLE) &&
+               !(nir_intrinsic_access(in) & ACCESS_VOLATILE)))) {
+            LLVMSetMetadata(value, LLVMGetMDKindIDInContext(t->ctx, "invariant.load", 14),
+               LLVMMetadataAsValue(t->ctx, LLVMMDNodeInContext2(t->ctx, NULL, 0)));
+         }
+         /* A fixed offset in an immutable launch buffer is shared by the warp.
           * Preserve that fact for the RISC-V SIMT divergence pass. */
-         if (in->intrinsic == nir_intrinsic_load_ubo &&
-             nir_src_is_const(in->src[0]) && nir_src_is_const(in->src[1]))
+         if (nir_src_is_const(in->src[0]) && nir_src_is_const(in->src[1]) &&
+             (in->intrinsic == nir_intrinsic_load_ubo ||
+              ((nir_intrinsic_access(in) & ACCESS_NON_WRITEABLE) &&
+               !(nir_intrinsic_access(in) & ACCESS_VOLATILE))))
             value = emit_uniform(t, value);
          ssa_set(t, in->def.index, c, value);
       }
@@ -2228,29 +2245,33 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       break;
    /* Per-thread scratch: addr = scratch base + dynamic offset. */
    case nir_intrinsic_load_scratch: {
-      LLVMValueRef addr = LLVMBuildAdd(t->b, emit_scratch_base(t),
-         vp_to_iptr(t, intr_src(t, in, 0)), "scaddr");
+      LLVMValueRef base = LLVMBuildIntToPtr(t->b, emit_scratch_base(t), t->ptr, "");
+      LLVMValueRef offset = vp_to_iptr(t, intr_src(t, in, 0));
+      LLVMValueRef addr = LLVMBuildGEP2(t->b, t->i8, base, &offset, 1, "scaddr");
       unsigned    esz = in->def.bit_size / 8u;
       for (unsigned c = 0; c < in->def.num_components; c++) {
-         LLVMValueRef a = LLVMBuildAdd(t->b, addr, vp_iptr_const(t, c * esz), "");
-         LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
+         LLVMValueRef offset = vp_iptr_const(t, c * esz);
+         LLVMValueRef a = LLVMBuildGEP2(t->b, t->i8, addr, &offset, 1, "");
+         LLVMValueRef p = a;
          ssa_set(t, in->def.index, c, vp_load_mem(t, in->def.bit_size, p, "scld"));
       }
       break;
    }
    case nir_intrinsic_store_scratch: {
-      LLVMValueRef addr = LLVMBuildAdd(t->b, emit_scratch_base(t),
-         vp_to_iptr(t, intr_src(t, in, 1)), "scaddr");
+      LLVMValueRef base = LLVMBuildIntToPtr(t->b, emit_scratch_base(t), t->ptr, "");
+      LLVMValueRef offset = vp_to_iptr(t, intr_src(t, in, 1));
+      LLVMValueRef addr = LLVMBuildGEP2(t->b, t->i8, base, &offset, 1, "scaddr");
       unsigned mask = nir_intrinsic_write_mask(in);
       unsigned nc   = nir_src_num_components(in->src[0]);
       unsigned esz  = nir_src_bit_size(in->src[0]) / 8u;
       for (unsigned c = 0; c < nc; c++) {
          if (!(mask & (1u << c))) continue;
          LLVMValueRef v = ssa_get(t, in->src[0].ssa->index, c);
-         LLVMValueRef a = LLVMBuildAdd(t->b, addr, vp_iptr_const(t, c * esz), "");
+         LLVMValueRef offset = vp_iptr_const(t, c * esz);
+         LLVMValueRef a = LLVMBuildGEP2(t->b, t->i8, addr, &offset, 1, "");
          if (v)
             LLVMBuildStore(t->b, vp_store_mem_val(t, nir_src_bit_size(in->src[0]), v),
-                           LLVMBuildIntToPtr(t->b, a, t->ptr, ""));
+                           a);
       }
       break;
    }
@@ -4453,6 +4474,10 @@ emit_phi(struct vp_tr *t, nir_phi_instr *phi)
    LLVMTypeRef ty = (phi->def.bit_size == 64) ? t->i64
                   : (phi->def.bit_size == 1)
                        ? LLVMInt1TypeInContext(t->ctx) : t->i32;
+   if (BITSET_TEST(t->float_types, phi->def.index)) {
+      if (phi->def.bit_size == 32) ty = t->f32;
+      if (phi->def.bit_size == 64) ty = t->f64;
+   }
    for (unsigned c = 0; c < phi->def.num_components; c++)
       ssa_set(t, phi->def.index, c, LLVMBuildPhi(t->b, ty, "phi"));
 }
@@ -4484,14 +4509,13 @@ emit_instr(struct vp_tr *t, nir_instr *instr)
       emit_phi(t, nir_instr_as_phi(instr));
       break;
    case nir_instr_type_undef: {
-      /* an undefined SSA value -- zero of the def's width is a safe
-       * materialization (the type must match its later uses / phis). */
+      /* Preserve undefined inputs so dead continuation state can be removed. */
       nir_undef_instr *u = nir_instr_as_undef(instr);
       LLVMTypeRef ut = u->def.bit_size == 64 ? t->i64
                      : u->def.bit_size == 1  ? LLVMInt1TypeInContext(t->ctx)
                                              : t->i32;
       for (unsigned c = 0; c < u->def.num_components; c++)
-         ssa_set(t, u->def.index, c, LLVMConstInt(ut, 0, false));
+         ssa_set(t, u->def.index, c, LLVMGetUndef(ut));
       break;
    }
    case nir_instr_type_jump:
@@ -4526,16 +4550,18 @@ emit_cfg(struct vp_tr *t, nir_function_impl *impl,
       bb[blk->index] = (n++ == 0) ? entry
          : LLVMAppendBasicBlockInContext(t->ctx, fn, "b");
 
+   t->float_types = calloc(BITSET_WORDS(impl->ssa_alloc), sizeof(BITSET_WORD));
+   nir_gather_types(impl, t->float_types, NULL);
    /* instructions + a terminator for every block */
    nir_foreach_block(blk, impl) {
       LLVMPositionBuilderAtEnd(t->b, bb[blk->index]);
       nir_foreach_instr(instr, blk) {
-         if (!emit_instr(t, instr)) { free(bb); return; }
+         if (!emit_instr(t, instr)) { free(t->float_types); free(bb); return; }
       }
       nir_if *nif = nir_block_get_following_if(blk);
       if (nif) {
          LLVMValueRef c = ssa_get(t, nif->condition.ssa->index, 0);
-         if (!c) { t->ok = false; free(bb); return; }
+         if (!c) { t->ok = false; free(t->float_types); free(bb); return; }
          if (LLVMTypeOf(c) != LLVMInt1TypeInContext(t->ctx))
             c = LLVMBuildICmp(t->b, LLVMIntNE, c,
                    LLVMConstInt(LLVMTypeOf(c), 0, false), "");
@@ -4556,19 +4582,23 @@ emit_cfg(struct vp_tr *t, nir_function_impl *impl,
             continue;
          nir_phi_instr *phi = nir_instr_as_phi(instr);
          for (unsigned c = 0; c < phi->def.num_components; c++) {
-            LLVMValueRef llphi = ssa_get(t, phi->def.index, c);
+            LLVMValueRef llphi = t->val[phi->def.index * VP_MAXC + c];
             if (!llphi)
                continue;
             nir_foreach_phi_src(src, phi) {
-               LLVMValueRef     v    = ssa_get(t, src->src.ssa->index, c);
                LLVMBasicBlockRef pred = bb[src->pred->index];
-               if (v)
+               LLVMPositionBuilderBefore(t->b, LLVMGetBasicBlockTerminator(pred));
+               LLVMValueRef v = ssa_get(t, src->src.ssa->index, c);
+               if (v) {
+                  if (LLVMTypeOf(v) != LLVMTypeOf(llphi))
+                     v = LLVMBuildBitCast(t->b, v, LLVMTypeOf(llphi), "phi_value");
                   LLVMAddIncoming(llphi, &v, &pred, 1);
+               }
             }
          }
       }
    }
-   free(bb);
+   free(t->float_types); free(bb);
 }
 
 /* Mark `fn` as a Vortex kernel entry: emit the @llvm.global.annotations
@@ -5981,6 +6011,11 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
       fn = LLVMAddFunction(t.mod, "kernel_main", kty);
       t.arg = LLVMGetParam(fn, 0);
       LLVMSetValueName2(t.arg, "arg", 3);
+      /* The runtime stages this argument block separately from shader data. */
+      LLVMAddAttributeAtIndex(fn, 1, LLVMCreateEnumAttribute(t.ctx,
+         LLVMGetEnumAttributeKindForName("noalias", 7), 0));
+      LLVMAddAttributeAtIndex(fn, 1, LLVMCreateEnumAttribute(t.ctx,
+         LLVMGetEnumAttributeKindForName("readonly", 8), 0));
    }
 
    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(t.ctx, fn, "entry");
