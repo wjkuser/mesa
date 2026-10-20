@@ -9,6 +9,8 @@
 enum query_word {
    Q_SCENE, Q_FLAGS, Q_MASK, Q_ORIGIN, Q_DIRECTION = Q_ORIGIN + 3,
    Q_MIN = Q_DIRECTION + 3, Q_MAX, Q_HANDLE, Q_PHASE, Q_ACTION, Q_GENERATED_T,
+   Q_BATCH_COUNT, Q_BATCH_CURSOR, Q_BATCH_ACCEPTED,
+   Q_BATCH_TAIL,
    Q_CANDIDATE = 32, Q_COMMITTED = Q_CANDIDATE + VX_RT_SLOT_COUNT,
    Q_WORDS = Q_COMMITTED + VX_RT_SLOT_COUNT,
 };
@@ -98,6 +100,9 @@ initialize(nir_builder *b, nir_intrinsic_instr *in, nir_deref_instr *state)
    store(b, state, Q_PHASE, nir_imm_int(b, Q_INITIALIZED));
    store(b, state, Q_ACTION, nir_imm_int(b, VX_RT_ACTION_START));
    store(b, state, Q_GENERATED_T, nir_imm_int(b, 0));
+   store(b, state, Q_BATCH_COUNT, nir_imm_int(b, 0));
+   store(b, state, Q_BATCH_CURSOR, nir_imm_int(b, 0));
+   store(b, state, Q_BATCH_ACCEPTED, nir_imm_int(b, -1));
    store(b, state, Q_COMMITTED + VX_RT_HIT_FLAGS, nir_imm_int(b, 0));
    store(b, state, Q_COMMITTED + VX_RT_HIT_T, in->src[7].ssa);
 }
@@ -106,8 +111,34 @@ static nir_def *
 proceed(nir_builder *b, nir_deref_instr *state, nir_def *continuation)
 {
    nir_push_if(b, nir_ine_imm(b, load(b, state, Q_PHASE), Q_COMPLETE));
+   nir_def *has_batch = nir_ine_imm(b, load(b, state, Q_BATCH_COUNT), 0);
+   nir_def *accepted = nir_ine_imm(b, load(b, state, Q_BATCH_ACCEPTED), -1);
+   nir_def *terminate_batch = nir_iand(b, nir_iand(b, has_batch, accepted),
+      nir_ine_imm(b, nir_iand_imm(b, load(b, state, Q_FLAGS),
+                               VX_RT_FLAG_TERMINATE_ON_FIRST_HIT), 0));
+   nir_push_if(b, terminate_batch);
+   store(b, state, Q_PHASE, nir_imm_int(b, Q_COMPLETE));
+   nir_push_else(b, NULL);
+   nir_push_if(b, nir_ult(b, load(b, state, Q_BATCH_CURSOR), load(b, state, Q_BATCH_COUNT)));
+   nir_def *first = nir_ieq_imm(b, load(b, state, Q_BATCH_CURSOR), 1);
+   nir_def *record[3];
+   for (unsigned i = 0; i < 3; ++i)
+      record[i] = nir_bcsel(b, first, load(b, state, Q_BATCH_TAIL + i),
+                           load(b, state, Q_BATCH_TAIL + 3 + i));
+   store(b, state, Q_CANDIDATE + VX_RT_HIT_PRIMITIVE_ID, record[0]);
+   store(b, state, Q_CANDIDATE + VX_RT_HIT_GEOMETRY_INDEX, record[1]);
+   store(b, state, Q_CANDIDATE + VX_RT_HIT_FLAGS, nir_ior(b,
+      nir_imm_int(b, VX_RT_HIT_VALID | VX_RT_HIT_PROCEDURAL),
+      nir_imul_imm(b, record[2], VX_RT_HIT_OPAQUE)));
+   store(b, state, Q_BATCH_CURSOR, nir_iadd_imm(b, load(b, state, Q_BATCH_CURSOR), 1));
+   store(b, state, Q_ACTION, nir_imm_int(b, VX_RT_ACTION_IGNORE));
+   nir_push_else(b, NULL);
+   nir_vortex_rt_set(b, load(b, state, Q_BATCH_ACCEPTED), .base = VX_RT_QUERY_BATCH_ACCEPTED);
    nir_vortex_rt_set(b, continuation, .base = VX_RT_QUERY_CONTEXT);
-   nir_vortex_rt_set(b, load(b, state, Q_ACTION), .base = VX_RT_QUERY_ACTION);
+   nir_vortex_rt_set(b, nir_bcsel(b, has_batch,
+      nir_bcsel(b, accepted, nir_imm_int(b, VX_RT_ACTION_BATCH_GENERATE),
+                            nir_imm_int(b, VX_RT_ACTION_BATCH_IGNORE)),
+      load(b, state, Q_ACTION)), .base = VX_RT_QUERY_ACTION);
    nir_vortex_rt_set(b, load(b, state, Q_GENERATED_T), .base = VX_RT_QUERY_DISTANCE);
    nir_def *flags = nir_ior(b, load(b, state, Q_FLAGS),
        nir_ishl_imm(b, nir_iand_imm(b, load(b, state, Q_MASK), 255), 16));
@@ -116,26 +147,28 @@ proceed(nir_builder *b, nir_deref_instr *state, nir_def *continuation)
        load_vector(b, state, Q_DIRECTION, 3),
        load(b, state, Q_MIN), load(b, state, Q_MAX)));
 
-   /* A pending lane stays inside proceed, before the application's loop body. */
-   nir_variable *event = nir_local_variable_create(b->impl, glsl_uint_type(), "rq_event");
-   nir_push_loop(b);
-   nir_def *status = nir_vortex_rt_event_wait(b, 32, load(b, state, Q_HANDLE));
-   nir_store_var(b, event, status, 1);
-   nir_push_if(b, nir_ine_imm(b, status, VX_RT_EVENT_PENDING));
-   nir_jump(b, nir_jump_break);
-   nir_pop_if(b, NULL);
-   nir_pop_loop(b, NULL);
-   nir_def *token = nir_load_var(b, event);
+   nir_def *token = nir_vortex_rt_event_wait(b, 32, load(b, state, Q_HANDLE));
    nir_push_if(b, nir_ieq_imm(b, token, VX_RT_EVENT_COMPLETE));
    nir_def *terminal = nir_vortex_rt_wait(b, 32, load(b, state, Q_HANDLE));
    snapshot(b, state, Q_COMMITTED, terminal, false);
    store(b, state, Q_PHASE, nir_imm_int(b, Q_COMPLETE));
    nir_push_else(b, NULL);
+   for (unsigned i = 0; i < 3; ++i) {
+      store(b, state, Q_BATCH_TAIL + i,
+            nir_vortex_rt_get(b, 32, token, .base = VX_RT_BATCH_PRIMITIVE + i));
+      store(b, state, Q_BATCH_TAIL + 3 + i,
+            nir_vortex_rt_get_committed(b, 32, token, .base = VX_RT_BATCH_PRIMITIVE + i));
+   }
+   store(b, state, Q_BATCH_COUNT, nir_vortex_rt_get(b, 32, token, .base = VX_RT_QUERY_BATCH_COUNT));
+   store(b, state, Q_BATCH_CURSOR, nir_imm_int(b, 1));
+   store(b, state, Q_BATCH_ACCEPTED, nir_imm_int(b, -1));
    snapshot(b, state, Q_CANDIDATE, token, false);
    snapshot(b, state, Q_COMMITTED, token, true);
    nir_vortex_rt_wait(b, 32, load(b, state, Q_HANDLE));
    store(b, state, Q_PHASE, nir_imm_int(b, Q_HAS_CANDIDATE));
    store(b, state, Q_ACTION, nir_imm_int(b, VX_RT_ACTION_IGNORE));
+   nir_pop_if(b, NULL);
+   nir_pop_if(b, NULL);
    nir_pop_if(b, NULL);
    nir_pop_if(b, NULL);
    return nir_ieq_imm(b, load(b, state, Q_PHASE), Q_HAS_CANDIDATE);
@@ -156,13 +189,7 @@ proceed_resident(nir_builder *b, nir_deref_instr *state)
    nir_vortex_rt_set(b, load(b, state, Q_GENERATED_T), .base = VX_RT_HIT_T);
    nir_vortex_rt_action(b, 32, load(b, state, Q_HANDLE), load(b, state, Q_ACTION));
    nir_pop_if(b, NULL);
-   nir_variable *event = nir_local_variable_create(b->impl, glsl_uint_type(), "resident_event");
-   nir_push_loop(b);
-   nir_def *status = nir_vortex_rt_event_wait(b, 32, load(b, state, Q_HANDLE));
-   nir_store_var(b, event, status, 1);
-   nir_break_if(b, nir_ine_imm(b, status, VX_RT_EVENT_PENDING));
-   nir_pop_loop(b, NULL);
-   nir_def *token = nir_load_var(b, event);
+   nir_def *token = nir_vortex_rt_event_wait(b, 32, load(b, state, Q_HANDLE));
    nir_push_if(b, nir_ieq_imm(b, token, VX_RT_EVENT_COMPLETE));
    nir_def *terminal = nir_vortex_rt_wait(b, 32, load(b, state, Q_HANDLE));
    snapshot(b, state, Q_COMMITTED, terminal, false);
@@ -339,6 +366,8 @@ vp_nir_lower_ray_tracing_to_rtu(nir_shader *shader)
             commit_candidate(&b, state);
             store(&b, state, Q_COMMITTED + VX_RT_HIT_T, t);
             store(&b, state, Q_GENERATED_T, t);
+            store(&b, state, Q_BATCH_ACCEPTED,
+                  nir_iadd_imm(&b, load(&b, state, Q_BATCH_CURSOR), -1));
             store(&b, state, Q_ACTION, nir_imm_int(&b, VX_RT_ACTION_GENERATE));
             nir_pop_if(&b, NULL);
             break;
