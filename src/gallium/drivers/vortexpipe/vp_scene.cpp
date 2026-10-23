@@ -106,21 +106,37 @@ public:
    uint32_t box(const uint8_t *base, const lvp_bvh_box_node &src)
    {
       VxBvhInternalNode out{};
-      vk_aabb bounds[2];
+      vk_aabb bounds[kVxBvh4Width];
+      uint32_t children[kVxBvh4Width];
       unsigned count = 0;
       for (unsigned i = 0; i < 2; ++i) {
          if (src.children[i] == LVP_BVH_INVALID_NODE)
             continue;
-         uint32_t child = node(base, src.children[i]);
-         bool leaf = (src.children[i] & 7u) != lvp_bvh_node_internal;
-         out.child_offsets[count] = child | (leaf ? RTU_BVH_CHILD_LEAF_FLAG : 0);
-         bounds[count++] = src.bounds[i];
+         // Collapse one binary level into the four child slots of the RTU node.
+         if ((src.children[i] & 7u) == lvp_bvh_node_internal) {
+            const auto &next = *reinterpret_cast<const lvp_bvh_box_node *>(
+               base + (src.children[i] & ~7u));
+            for (unsigned j = 0; j < 2; ++j) {
+               if (next.children[j] == LVP_BVH_INVALID_NODE)
+                  continue;
+               children[count] = next.children[j];
+               bounds[count++] = next.bounds[j];
+            }
+         } else {
+            children[count] = src.children[i];
+            bounds[count++] = src.bounds[i];
+         }
+      }
+      for (unsigned i = 0; i < count; ++i) {
+         uint32_t child = node(base, children[i]);
+         bool leaf = (children[i] & 7u) != lvp_bvh_node_internal;
+         out.child_offsets[i] = child | (leaf ? RTU_BVH_CHILD_LEAF_FLAG : 0);
       }
       if (!count)
          return append(VxBvhLeafHeader{RTU_BVH_KIND_LEAF_TRI, 0, 0, 0});
       out.kind = count << RTU_BVH_COUNT_SHIFT;
       for (unsigned axis = 0; axis < 3; ++axis) {
-         float low[2], high[2];
+         float low[kVxBvh4Width], high[kVxBvh4Width];
          for (unsigned i = 0; i < count; ++i) {
             memcpy(&low[i], reinterpret_cast<const uint8_t *>(&bounds[i].min) + axis*4, 4);
             memcpy(&high[i], reinterpret_cast<const uint8_t *>(&bounds[i].max) + axis*4, 4);
