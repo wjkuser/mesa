@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: MIT */
 #include "vp_scene.h"
 #include "../../frontends/lavapipe/lvp_bvh.h"
-#include "bvh.h"
-#include "scene_layout.h"
+#include <hackrtcore/bvh.h>
+#include <hackrtcore/scene_layout.h>
+#include <hackrtcore/scene_builder.h>
 
 #include <algorithm>
 #include <array>
@@ -17,6 +18,7 @@ using namespace vortex::rtu;
 
 class Scene {
 public:
+   BvhLayout layout = BvhLayout::from_environment();
    std::vector<uint8_t> bytes = std::vector<uint8_t>(RTU_BVH_SCENE_HDR_BYTES);
    std::vector<std::array<uint8_t, RTU_INSTANCE_METADATA_BYTES>> instances;
    std::unordered_map<const void *, uint32_t> roots;
@@ -34,20 +36,72 @@ public:
       auto found = roots.find(base);
       if (found != roots.end())
          return found->second;
-      uint32_t root = node(static_cast<const uint8_t *>(base), LVP_BVH_ROOT_NODE);
+      std::vector<vortex::raytrace::BvhPrimitive> primitives;
+      collect(static_cast<const uint8_t *>(base), LVP_BVH_ROOT_NODE, primitives);
+      std::stable_sort(primitives.begin(), primitives.end(), [](const auto &a, const auto &b) {
+         VxBvhLeafHeader ah, bh;
+         memcpy(&ah, a.payload.data(), sizeof(ah));
+         memcpy(&bh, b.payload.data(), sizeof(bh));
+         return std::pair(ah.geometry_index, ah.prim_base) < std::pair(bh.geometry_index, bh.prim_base);
+      });
+      uint32_t root = vortex::raytrace::append_bvh(primitives, layout, bytes);
+      if (root == UINT32_MAX)
+         throw std::runtime_error("RTU BVH exceeds leaf address range");
       roots.emplace(base, root);
       return root;
+   }
+
+   void collect(const uint8_t *base, uint32_t id,
+                std::vector<vortex::raytrace::BvhPrimitive> &primitives)
+   {
+      if (id == LVP_BVH_INVALID_NODE)
+         return;
+      if ((id & 7u) == lvp_bvh_node_internal) {
+         const auto &box = *reinterpret_cast<const lvp_bvh_box_node *>(base + (id & ~7u));
+         collect(base, box.children[0], primitives);
+         collect(base, box.children[1], primitives);
+         return;
+      }
+      const uint32_t offset = node(base, id);
+      vortex::raytrace::BvhPrimitive primitive{};
+      primitive.payload.assign(bytes.begin() + offset, bytes.end());
+      bytes.resize(offset);
+      const void *source = base + (id & ~7u);
+      if ((id & 7u) == lvp_bvh_node_triangle) {
+         const auto &tri = *static_cast<const lvp_bvh_triangle_node *>(source);
+         for (unsigned a = 0; a < 3; ++a) {
+            primitive.mn[a] = std::min({tri.coords[0][a], tri.coords[1][a], tri.coords[2][a]});
+            primitive.mx[a] = std::max({tri.coords[0][a], tri.coords[1][a], tri.coords[2][a]});
+         }
+      } else if ((id & 7u) == lvp_bvh_node_aabb) {
+         const auto &box = static_cast<const lvp_bvh_aabb_node *>(source)->bounds;
+         memcpy(primitive.mn, &box.min, sizeof(primitive.mn));
+         memcpy(primitive.mx, &box.max, sizeof(primitive.mx));
+      } else {
+         const auto &instance = *static_cast<const lvp_bvh_instance_node *>(source);
+         const auto &box = reinterpret_cast<const lvp_bvh_header *>(instance.bvh_ptr)->bounds;
+         const float *low = reinterpret_cast<const float *>(&box.min);
+         const float *high = reinterpret_cast<const float *>(&box.max);
+         for (unsigned a = 0; a < 3; ++a) {
+            const float *row = instance.otw_matrix.values[a];
+            primitive.mn[a] = primitive.mx[a] = row[3];
+            for (unsigned b = 0; b < 3; ++b) {
+               primitive.mn[a] += std::min(row[b] * low[b], row[b] * high[b]);
+               primitive.mx[a] += std::max(row[b] * low[b], row[b] * high[b]);
+            }
+         }
+      }
+      primitives.push_back(std::move(primitive));
    }
 
    uint32_t node(const uint8_t *base, uint32_t id)
    {
       const void *source = base + (id & ~7u);
       switch (id & 7u) {
-      case lvp_bvh_node_internal:
-         return box(base, *static_cast<const lvp_bvh_box_node *>(source));
       case lvp_bvh_node_triangle: {
          const auto &src = *static_cast<const lvp_bvh_triangle_node *>(source);
          uint32_t opaque = (src.geometry_id_and_flags & LVP_GEOMETRY_OPAQUE) ? 1 : 0;
+         bytes.resize((bytes.size() + 15) & ~size_t(15), 0);
          uint32_t offset = append(VxBvhLeafHeader{
             RTU_BVH_KIND_LEAF_TRI | (1u << RTU_BVH_COUNT_SHIFT),
             src.geometry_id_and_flags & 0x0fffffffu, opaque, src.primitive_id});
@@ -56,11 +110,13 @@ public:
          memcpy(triangle.v1, src.coords[1], sizeof(triangle.v1));
          memcpy(triangle.v2, src.coords[2], sizeof(triangle.v2));
          triangle.flags = opaque;
+         triangle.primitive_id = src.primitive_id;
          append(triangle);
          return offset;
       }
       case lvp_bvh_node_aabb: {
          const auto &src = *static_cast<const lvp_bvh_aabb_node *>(source);
+         bytes.resize((bytes.size() + 15) & ~size_t(15), 0);
          uint32_t offset = append(VxBvhLeafHeader{
             RTU_BVH_KIND_LEAF_PROC | (1u << RTU_BVH_COUNT_SHIFT),
             src.geometry_id_and_flags & 0x0fffffffu,
@@ -69,6 +125,7 @@ public:
          VxBvhProcAabb bounds{};
          memcpy(bounds.aabb_min, &src.bounds.min, sizeof(bounds.aabb_min));
          memcpy(bounds.aabb_max, &src.bounds.max, sizeof(bounds.aabb_max));
+         bounds.primitive_id = src.primitive_id;
          append(bounds);
          return offset;
       }
@@ -94,8 +151,9 @@ public:
          memcpy(metadata.data() + 48, src.wto_matrix.values, 48);
          uint32_t sbt_offset = flags & 0xffffffu;
          memcpy(metadata.data() + RTU_INSTANCE_METADATA_SBT_OFFSET, &sbt_offset, 4);
+         bytes.resize((bytes.size() + 15) & ~size_t(15), 0);
          uint32_t offset = append(VxBvhLeafHeader{
-            RTU_BVH_KIND_LEAF_INST | (1u << RTU_BVH_COUNT_SHIFT), 0, 0, 0});
+            RTU_BVH_KIND_LEAF_INST | (1u << RTU_BVH_COUNT_SHIFT), 0, 0, src.instance_id});
          append(instance);
          return offset;
       }
@@ -103,64 +161,7 @@ public:
       std::abort();
    }
 
-   uint32_t box(const uint8_t *base, const lvp_bvh_box_node &src)
-   {
-      VxBvhInternalNode out{};
-      vk_aabb bounds[kVxBvh4Width];
-      uint32_t children[kVxBvh4Width];
-      unsigned count = 0;
-      for (unsigned i = 0; i < 2; ++i) {
-         if (src.children[i] == LVP_BVH_INVALID_NODE)
-            continue;
-         // Collapse one binary level into the four child slots of the RTU node.
-         if ((src.children[i] & 7u) == lvp_bvh_node_internal) {
-            const auto &next = *reinterpret_cast<const lvp_bvh_box_node *>(
-               base + (src.children[i] & ~7u));
-            for (unsigned j = 0; j < 2; ++j) {
-               if (next.children[j] == LVP_BVH_INVALID_NODE)
-                  continue;
-               children[count] = next.children[j];
-               bounds[count++] = next.bounds[j];
-            }
-         } else {
-            children[count] = src.children[i];
-            bounds[count++] = src.bounds[i];
-         }
-      }
-      for (unsigned i = 0; i < count; ++i) {
-         uint32_t child = node(base, children[i]);
-         bool leaf = (children[i] & 7u) != lvp_bvh_node_internal;
-         out.child_offsets[i] = child | (leaf ? RTU_BVH_CHILD_LEAF_FLAG : 0);
-      }
-      if (!count)
-         return append(VxBvhLeafHeader{RTU_BVH_KIND_LEAF_TRI, 0, 0, 0});
-      out.kind = count << RTU_BVH_COUNT_SHIFT;
-      for (unsigned axis = 0; axis < 3; ++axis) {
-         float low[kVxBvh4Width], high[kVxBvh4Width];
-         for (unsigned i = 0; i < count; ++i) {
-            memcpy(&low[i], reinterpret_cast<const uint8_t *>(&bounds[i].min) + axis*4, 4);
-            memcpy(&high[i], reinterpret_cast<const uint8_t *>(&bounds[i].max) + axis*4, 4);
-         }
-         float origin = low[0], upper = high[0];
-         for (unsigned i = 1; i < count; ++i) {
-            origin = std::min(origin, low[i]);
-            upper = std::max(upper, high[i]);
-         }
-         int exponent = 0;
-         if (upper > origin)
-            std::frexp((upper - origin) / 255.0f, &exponent);
-         exponent = std::clamp(exponent, -127, 127);
-         float step = std::ldexp(1.0f, exponent);
-         out.origin[axis] = origin;
-         out.exp[axis] = exponent;
-         for (unsigned i = 0; i < count; ++i) {
-            out.qaabb_min[i][axis] = std::clamp(int(std::floor((low[i] - origin)/step)), 0, 255);
-            out.qaabb_max[i][axis] = std::clamp(int(std::ceil((high[i] - origin)/step)), 0, 255);
-         }
-      }
-      bytes.resize((bytes.size() + sizeof(out) - 1) & ~(sizeof(out) - 1), 0);
-      return append(out);
-   }
+
 };
 }
 
@@ -172,7 +173,7 @@ vp_build_scene(const void *acceleration_structure, uint32_t *size)
    uint32_t table = scene.bytes.size();
    for (const auto &instance : scene.instances)
       scene.append(instance);
-   uint32_t header[] = {root, RTU_SCENE_KIND_BVH4, uint32_t(scene.bytes.size()), table};
+   uint32_t header[] = {root, RTU_SCENE_KIND_BVH_WIDE, uint32_t(scene.bytes.size()), table};
    memcpy(scene.bytes.data(), header, sizeof(header));
    *size = scene.bytes.size();
    auto *result = static_cast<uint8_t *>(malloc(*size));
