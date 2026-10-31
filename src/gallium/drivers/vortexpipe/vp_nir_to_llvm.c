@@ -33,6 +33,7 @@
 #endif
 
 #include <assert.h>          /* static_assert */
+#include <math.h>            /* isfinite */
 #include <stddef.h>          /* offsetof */
 #include <stdio.h>
 #include <stdlib.h>
@@ -1175,7 +1176,17 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
                   LLVMConstReal(ft, -1.0), z, ""), "");
          } else {
             LLVMValueRef fb = as_float(t, alu_src(t, alu, 1, c), bs);
-            if (alu->op == nir_op_fdiv)
+            /* Division by a constant: SPIR-V's default AllowRecip lets x / c be
+             * x * (1 / c), and the NVIDIA compiler emits exactly that multiply by
+             * the f32-rounded reciprocal (native SASS of the validation shaders).
+             * Exact operations and non-finite reciprocals keep the division. */
+            const float divisor = alu->op == nir_op_fdiv && bs == 32 && !alu->exact &&
+                                  nir_src_is_const(alu->src[1].src)
+               ? (float)nir_src_comp_as_float(alu->src[1].src, alu->src[1].swizzle[c]) : 0.0f;
+            const float reciprocal = 1.0f / divisor;
+            if (divisor != 0.0f && isfinite(reciprocal))
+               res = LLVMBuildFMul(t->b, fa, LLVMConstReal(ft, reciprocal), "");
+            else if (alu->op == nir_op_fdiv)
                res = LLVMBuildFDiv(t->b, fa, fb, "");
             else if (alu->op == nir_op_fmin || alu->op == nir_op_fmax)
                res = emit_fminmax(t, fa, fb, alu->op == nir_op_fmax);

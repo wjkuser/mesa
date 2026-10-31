@@ -16,6 +16,7 @@
 #include "VX_types.h"
 #else
 #include "scene_layout.h"
+#include "registers.h"
 #endif
 
 #include "vk_pipeline.h"
@@ -938,7 +939,9 @@ lvp_trace_ray_query(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *co
    variable->data.ray_query = true;
    variable->data.rtu_resident_query = lvp_can_keep_traversal_resident(compiler->pipeline);
    nir_def *query = &nir_build_deref_var(b, variable)->def;
-   nir_rq_initialize(b, query, scene, flags, mask, origin, tmin, direction, tmax);
+   nir_rq_initialize(b, query, scene,
+                    nir_ior_imm(b, flags, VX_RT_FLAG_TRACE_PIPELINE),
+                    mask, origin, tmin, direction, tmax);
    struct lvp_ray_traversal_args args = { .data = compiler };
    struct lvp_ray_flags ray_flags = {
       .terminate_on_first_hit = nir_test_mask(b, flags, SpvRayFlagsTerminateOnFirstHitKHRMask),

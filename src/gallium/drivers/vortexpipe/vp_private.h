@@ -20,6 +20,7 @@
 
 #include "util/hash_table.h"
 #include "util/simple_mtx.h"
+#include "util/vma.h"
 #include "pipe/p_screen.h"
 #include "pipe/p_context.h"
 #include "pipe/p_state.h"      /* struct pipe_vertex_buffer (stored by value) */
@@ -101,6 +102,8 @@ struct vp_screen {
     * aliasing a driver-side cache. */
    struct vp_resident *resident;
    struct vp_memory *memory;
+   struct util_vma_heap memory_heap;     /* addresses inside memory_window */
+   void               *memory_window;
    unsigned            n_resident;
    unsigned            resident_cap;
    simple_mtx_t        resident_lock;

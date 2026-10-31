@@ -9,7 +9,7 @@
 struct pipe_screen;
 struct pipe_resource;
 
-void vp_memory_init(struct pipe_screen *screen);
+bool vp_memory_init(struct pipe_screen *screen);
 void vp_memory_finish(struct pipe_screen *screen);
 void vp_memory_resource_destroy(struct pipe_screen *screen, struct pipe_resource *resource);
 bool vp_memory_lookup(struct pipe_screen *screen, const void *host, uint32_t size,

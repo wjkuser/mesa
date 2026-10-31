@@ -10,13 +10,30 @@
 /* Buffer device addresses retain their value when stored in another buffer.
  * Give each allocation the same address in the host and RV32 address spaces;
  * shaders can then follow pointer graphs without descriptor-specific fixups.
- * Host/device copies are performed at queue dispatch boundaries. */
+ * Host/device copies are performed at queue dispatch boundaries.
+ *
+ * Allocations come from one fixed host window in first-fit order. Device
+ * addresses then depend only on the application's allocation sequence, so
+ * simulated cache and bank mapping is reproducible across processes. */
+#define VP_MEMORY_WINDOW_BASE 0x40000000ull
+#define VP_MEMORY_WINDOW_SIZE 0x40000000ull
 struct vp_memory {
    struct llvmpipe_memory_allocation backing;
    vx_buffer_h buffer;
    struct pipe_resource *owner;
    struct vp_memory *next;
 };
+
+/* Return the pages to the window: zero-filled and inaccessible until reuse. */
+static void
+release_backing(struct vp_screen *vps, struct vp_memory *mem)
+{
+   mmap(mem->backing.cpu_addr, mem->backing.size, PROT_NONE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+   simple_mtx_lock(&vps->resident_lock);
+   util_vma_heap_free(&vps->memory_heap, (uintptr_t)mem->backing.cpu_addr, mem->backing.size);
+   simple_mtx_unlock(&vps->resident_lock);
+}
 
 static struct pipe_memory_allocation *
 allocate_memory(struct pipe_screen *screen, uint64_t size)
@@ -27,9 +44,19 @@ allocate_memory(struct pipe_screen *screen, uint64_t size)
       return NULL;
    uint64_t page = sysconf(_SC_PAGESIZE);
    mem->backing.size = (size + page - 1) & ~(page - 1);
-   mem->backing.cpu_addr = mmap(NULL, mem->backing.size, PROT_READ | PROT_WRITE,
-                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
-   if (mem->backing.cpu_addr == MAP_FAILED) {
+   simple_mtx_lock(&vps->resident_lock);
+   uint64_t addr = util_vma_heap_alloc(&vps->memory_heap, mem->backing.size, page);
+   simple_mtx_unlock(&vps->resident_lock);
+   if (!addr) {
+      mesa_loge("vortexpipe: device memory window exhausted");
+      free(mem);
+      return NULL;
+   }
+   mem->backing.cpu_addr = (void *)(uintptr_t)addr;
+   if (mprotect(mem->backing.cpu_addr, mem->backing.size, PROT_READ | PROT_WRITE)) {
+      simple_mtx_lock(&vps->resident_lock);
+      util_vma_heap_free(&vps->memory_heap, addr, mem->backing.size);
+      simple_mtx_unlock(&vps->resident_lock);
       free(mem);
       return NULL;
    }
@@ -37,7 +64,7 @@ allocate_memory(struct pipe_screen *screen, uint64_t size)
                                           mem->backing.size, 0, &mem->buffer);
    if (result != VX_SUCCESS) {
       mesa_loge("vortexpipe: reserve buffer address: %s", vx_result_string(result));
-      munmap(mem->backing.cpu_addr, mem->backing.size);
+      release_backing(vps, mem);
       free(mem);
       return NULL;
    }
@@ -60,7 +87,7 @@ free_memory(struct pipe_screen *screen, struct pipe_memory_allocation *allocatio
    *entry = mem->next;
    simple_mtx_unlock(&vps->resident_lock);
    vx_buffer_release(mem->buffer);
-   munmap(mem->backing.cpu_addr, mem->backing.size);
+   release_backing(vps, mem);
    free(mem);
 }
 
@@ -133,12 +160,27 @@ vp_memory_transfer(struct pipe_screen *screen, vx_queue_h queue, bool readback)
    return result;
 }
 
-void
+bool
 vp_memory_init(struct pipe_screen *screen)
 {
+   struct vp_screen *vps = vp_reg_get(screen);
+   vps->memory_window = mmap((void *)(uintptr_t)VP_MEMORY_WINDOW_BASE, VP_MEMORY_WINDOW_SIZE,
+                             PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE |
+                             MAP_FIXED_NOREPLACE, -1, 0);
+   if (vps->memory_window != (void *)(uintptr_t)VP_MEMORY_WINDOW_BASE) {
+      mesa_loge("vortexpipe: device memory window %#llx is unavailable",
+                (unsigned long long)VP_MEMORY_WINDOW_BASE);
+      if (vps->memory_window != MAP_FAILED)
+         munmap(vps->memory_window, VP_MEMORY_WINDOW_SIZE);
+      vps->memory_window = NULL;
+      return false;
+   }
+   util_vma_heap_init(&vps->memory_heap, VP_MEMORY_WINDOW_BASE, VP_MEMORY_WINDOW_SIZE);
+   vps->memory_heap.alloc_high = false;
    screen->allocate_memory = allocate_memory;
    screen->free_memory = free_memory;
    screen->resource_create = resource_create;
+   return true;
 }
 
 void
@@ -147,4 +189,9 @@ vp_memory_finish(struct pipe_screen *screen)
    struct vp_screen *vps = vp_reg_get(screen);
    while (vps->memory)
       free_memory(screen, (struct pipe_memory_allocation *)vps->memory);
+   if (vps->memory_window) {
+      util_vma_heap_finish(&vps->memory_heap);
+      munmap(vps->memory_window, VP_MEMORY_WINDOW_SIZE);
+      vps->memory_window = NULL;
+   }
 }

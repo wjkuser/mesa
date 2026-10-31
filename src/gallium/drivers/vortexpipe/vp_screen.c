@@ -644,7 +644,10 @@ vortexpipe_create_screen(struct sw_winsys *winsys)
    screen->is_format_supported = vp_screen_is_format_supported;
    screen->resource_destroy    = vp_resource_destroy;
 #ifdef VP_COMPUTE_ONLY
-   vp_memory_init(screen);
+   if (!vp_memory_init(screen)) {
+      screen->destroy(screen);
+      return NULL;
+   }
 #endif
 
    /* Clamp llvmpipe's compute caps to the Vortex hardware cap so well-

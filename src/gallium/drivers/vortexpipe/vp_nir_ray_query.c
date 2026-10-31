@@ -10,7 +10,7 @@ enum query_word {
    Q_SCENE, Q_FLAGS, Q_MASK, Q_ORIGIN, Q_DIRECTION = Q_ORIGIN + 3,
    Q_MIN = Q_DIRECTION + 3, Q_MAX, Q_HANDLE, Q_PHASE, Q_ACTION, Q_GENERATED_T,
    Q_BATCH_COUNT, Q_BATCH_CURSOR, Q_BATCH_ACCEPTED,
-   Q_BATCH_TAIL,
+   Q_BATCH_TAIL, Q_RANGE_ADDRESS = Q_BATCH_TAIL + 6, Q_RANGE_COUNT, Q_RANGE_CURSOR,
    Q_CANDIDATE = 32, Q_COMMITTED = Q_CANDIDATE + VX_RT_SLOT_COUNT,
    Q_WORDS = Q_COMMITTED + VX_RT_SLOT_COUNT,
 };
@@ -100,11 +100,53 @@ initialize(nir_builder *b, nir_intrinsic_instr *in, nir_deref_instr *state)
    store(b, state, Q_PHASE, nir_imm_int(b, Q_INITIALIZED));
    store(b, state, Q_ACTION, nir_imm_int(b, VX_RT_ACTION_START));
    store(b, state, Q_GENERATED_T, nir_imm_int(b, 0));
+   store(b, state, Q_RANGE_COUNT, nir_imm_int(b, 0));
+   store(b, state, Q_RANGE_CURSOR, nir_imm_int(b, 0));
    store(b, state, Q_BATCH_COUNT, nir_imm_int(b, 0));
    store(b, state, Q_BATCH_CURSOR, nir_imm_int(b, 0));
    store(b, state, Q_BATCH_ACCEPTED, nir_imm_int(b, -1));
    store(b, state, Q_COMMITTED + VX_RT_HIT_FLAGS, nir_imm_int(b, 0));
    store(b, state, Q_COMMITTED + VX_RT_HIT_T, in->src[7].ssa);
+}
+
+/* A procedural leaf returns the address and length of its primitive-ID list;
+ * each proceed consumes the next ID. */
+static void
+load_range(nir_builder *b, nir_deref_instr *state)
+{
+   store(b, state, Q_RANGE_ADDRESS, load(b, state, Q_CANDIDATE + VX_RT_LEAF_PRIMITIVES));
+   store(b, state, Q_RANGE_COUNT, load(b, state, Q_CANDIDATE + VX_RT_LEAF_PRIMITIVE_COUNT));
+   store(b, state, Q_RANGE_CURSOR, nir_imm_int(b, 0));
+}
+
+static nir_def *
+range_pending(nir_builder *b, nir_deref_instr *state)
+{
+   return nir_ult(b, load(b, state, Q_RANGE_CURSOR), load(b, state, Q_RANGE_COUNT));
+}
+
+static void
+load_primitive(nir_builder *b, nir_deref_instr *state)
+{
+   nir_def *address = nir_iadd(b, load(b, state, Q_RANGE_ADDRESS),
+      nir_imul_imm(b, load(b, state, Q_RANGE_CURSOR), 4));
+   store(b, state, Q_CANDIDATE + VX_RT_HIT_PRIMITIVE_ID,
+      nir_load_global(b, nir_u2u64(b, address), 4, 1, 32));
+   store(b, state, Q_RANGE_CURSOR, nir_iadd_imm(b, load(b, state, Q_RANGE_CURSOR), 1));
+}
+
+/* A generated (procedural) hit returns its distance and accepted primitive; the
+ * RTU reads them only for GENERATE actions, so other candidates skip the SETs. */
+static void
+set_generated_hit(nir_builder *b, nir_deref_instr *state)
+{
+   nir_def *action = load(b, state, Q_ACTION);
+   nir_push_if(b, nir_ior(b, nir_ieq_imm(b, action, VX_RT_ACTION_GENERATE),
+                          nir_ieq_imm(b, action, VX_RT_ACTION_GENERATE_TERMINATE)));
+   nir_vortex_rt_set(b, load(b, state, Q_COMMITTED + VX_RT_HIT_PRIMITIVE_ID),
+                     .base = VX_RT_HIT_PRIMITIVE_ID);
+   nir_vortex_rt_set(b, load(b, state, Q_GENERATED_T), .base = VX_RT_HIT_T);
+   nir_pop_if(b, NULL);
 }
 
 static nir_def *
@@ -119,21 +161,32 @@ proceed(nir_builder *b, nir_deref_instr *state, nir_def *continuation)
    nir_push_if(b, terminate_batch);
    store(b, state, Q_PHASE, nir_imm_int(b, Q_COMPLETE));
    nir_push_else(b, NULL);
+   nir_push_if(b, range_pending(b, state));
+   load_primitive(b, state);
+   nir_push_else(b, NULL);
    nir_push_if(b, nir_ult(b, load(b, state, Q_BATCH_CURSOR), load(b, state, Q_BATCH_COUNT)));
    nir_def *first = nir_ieq_imm(b, load(b, state, Q_BATCH_CURSOR), 1);
    nir_def *record[3];
    for (unsigned i = 0; i < 3; ++i)
       record[i] = nir_bcsel(b, first, load(b, state, Q_BATCH_TAIL + i),
                            load(b, state, Q_BATCH_TAIL + 3 + i));
-   store(b, state, Q_CANDIDATE + VX_RT_HIT_PRIMITIVE_ID, record[0]);
+   store(b, state, Q_CANDIDATE + VX_RT_LEAF_PRIMITIVES, record[0]);
    store(b, state, Q_CANDIDATE + VX_RT_HIT_GEOMETRY_INDEX, record[1]);
    store(b, state, Q_CANDIDATE + VX_RT_HIT_FLAGS, nir_ior(b,
       nir_imm_int(b, VX_RT_HIT_VALID | VX_RT_HIT_PROCEDURAL),
-      nir_imul_imm(b, record[2], VX_RT_HIT_OPAQUE)));
+      nir_imul_imm(b, nir_iand_imm(b, record[2], 1), VX_RT_HIT_OPAQUE)));
+   store(b, state, Q_CANDIDATE + VX_RT_LEAF_PRIMITIVE_COUNT, nir_ushr_imm(b, record[2], 1));
+   load_range(b, state);
+   load_primitive(b, state);
    store(b, state, Q_BATCH_CURSOR, nir_iadd_imm(b, load(b, state, Q_BATCH_CURSOR), 1));
    store(b, state, Q_ACTION, nir_imm_int(b, VX_RT_ACTION_IGNORE));
    nir_push_else(b, NULL);
    nir_vortex_rt_set(b, load(b, state, Q_BATCH_ACCEPTED), .base = VX_RT_QUERY_BATCH_ACCEPTED);
+   /* Only a generated batch hit restores an accepted primitive. */
+   nir_push_if(b, nir_iand(b, has_batch, accepted));
+   nir_vortex_rt_set(b, load(b, state, Q_COMMITTED + VX_RT_HIT_PRIMITIVE_ID),
+                     .base = VX_RT_HIT_PRIMITIVE_ID);
+   nir_pop_if(b, NULL);
    nir_vortex_rt_set(b, continuation, .base = VX_RT_QUERY_CONTEXT);
    nir_vortex_rt_set(b, nir_bcsel(b, has_batch,
       nir_bcsel(b, accepted, nir_imm_int(b, VX_RT_ACTION_BATCH_GENERATE),
@@ -164,9 +217,14 @@ proceed(nir_builder *b, nir_deref_instr *state, nir_def *continuation)
    store(b, state, Q_BATCH_ACCEPTED, nir_imm_int(b, -1));
    snapshot(b, state, Q_CANDIDATE, token, false);
    snapshot(b, state, Q_COMMITTED, token, true);
+   nir_push_if(b, nir_ieq_imm(b, token, VX_RT_EVENT_AABB));
+   load_range(b, state);
+   load_primitive(b, state);
+   nir_pop_if(b, NULL);
    nir_vortex_rt_wait(b, 32, load(b, state, Q_HANDLE));
    store(b, state, Q_PHASE, nir_imm_int(b, Q_HAS_CANDIDATE));
    store(b, state, Q_ACTION, nir_imm_int(b, VX_RT_ACTION_IGNORE));
+   nir_pop_if(b, NULL);
    nir_pop_if(b, NULL);
    nir_pop_if(b, NULL);
    nir_pop_if(b, NULL);
@@ -178,6 +236,12 @@ static nir_def *
 proceed_resident(nir_builder *b, nir_deref_instr *state)
 {
    nir_push_if(b, nir_ine_imm(b, load(b, state, Q_PHASE), Q_COMPLETE));
+   nir_def *first_hit = nir_iand(b,
+      nir_ieq_imm(b, load(b, state, Q_ACTION), VX_RT_ACTION_GENERATE),
+      nir_ine_imm(b, nir_iand_imm(b, load(b, state, Q_FLAGS), VX_RT_FLAG_TERMINATE_ON_FIRST_HIT), 0));
+   nir_push_if(b, nir_iand(b, nir_inot(b, first_hit), range_pending(b, state)));
+   load_primitive(b, state);
+   nir_push_else(b, NULL);
    nir_push_if(b, nir_ieq_imm(b, load(b, state, Q_PHASE), Q_INITIALIZED));
    nir_vortex_rt_set(b, nir_imm_int(b, 0), .base = VX_RT_QUERY_CONTEXT);
    nir_def *flags = nir_ior(b, load(b, state, Q_FLAGS),
@@ -186,7 +250,7 @@ proceed_resident(nir_builder *b, nir_deref_instr *state)
        load(b, state, Q_SCENE), flags, load_vector(b, state, Q_ORIGIN, 3),
        load_vector(b, state, Q_DIRECTION, 3), load(b, state, Q_MIN), load(b, state, Q_MAX)));
    nir_push_else(b, NULL);
-   nir_vortex_rt_set(b, load(b, state, Q_GENERATED_T), .base = VX_RT_HIT_T);
+   set_generated_hit(b, state);
    nir_vortex_rt_action(b, 32, load(b, state, Q_HANDLE), load(b, state, Q_ACTION));
    nir_pop_if(b, NULL);
    nir_def *token = nir_vortex_rt_event_wait(b, 32, load(b, state, Q_HANDLE));
@@ -197,8 +261,13 @@ proceed_resident(nir_builder *b, nir_deref_instr *state)
    nir_push_else(b, NULL);
    snapshot(b, state, Q_CANDIDATE, token, false);
    snapshot(b, state, Q_COMMITTED, token, true);
+   nir_push_if(b, nir_ieq_imm(b, token, VX_RT_EVENT_AABB));
+   load_range(b, state);
+   load_primitive(b, state);
+   nir_pop_if(b, NULL);
    store(b, state, Q_PHASE, nir_imm_int(b, Q_HAS_CANDIDATE));
    store(b, state, Q_ACTION, nir_imm_int(b, VX_RT_ACTION_IGNORE));
+   nir_pop_if(b, NULL);
    nir_pop_if(b, NULL);
    nir_pop_if(b, NULL);
    return nir_ieq_imm(b, load(b, state, Q_PHASE), Q_HAS_CANDIDATE);
@@ -213,7 +282,7 @@ terminate_resident(nir_builder *b, nir_deref_instr *state)
       nir_imm_int(b, VX_RT_ACTION_GENERATE_TERMINATE),
       nir_bcsel(b, nir_ieq_imm(b, action, VX_RT_ACTION_ACCEPT),
          nir_imm_int(b, VX_RT_ACTION_ACCEPT_TERMINATE), nir_imm_int(b, VX_RT_ACTION_TERMINATE)));
-   nir_vortex_rt_set(b, load(b, state, Q_GENERATED_T), .base = VX_RT_HIT_T);
+   set_generated_hit(b, state);
    nir_vortex_rt_action(b, 32, load(b, state, Q_HANDLE), action);
    nir_def *terminal = nir_vortex_rt_wait(b, 32, load(b, state, Q_HANDLE));
    snapshot(b, state, Q_COMMITTED, terminal, false);

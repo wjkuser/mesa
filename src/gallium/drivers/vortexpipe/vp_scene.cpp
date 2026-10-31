@@ -122,11 +122,7 @@ public:
             src.geometry_id_and_flags & 0x0fffffffu,
             (src.geometry_id_and_flags & LVP_GEOMETRY_OPAQUE) ? 1u : 0u,
             src.primitive_id});
-         VxBvhProcAabb bounds{};
-         memcpy(bounds.aabb_min, &src.bounds.min, sizeof(bounds.aabb_min));
-         memcpy(bounds.aabb_max, &src.bounds.max, sizeof(bounds.aabb_max));
-         bounds.primitive_id = src.primitive_id;
-         append(bounds);
+         append(src.primitive_id);
          return offset;
       }
       case lvp_bvh_node_instance: {
