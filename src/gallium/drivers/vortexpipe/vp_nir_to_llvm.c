@@ -1939,6 +1939,20 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
     * fields rewritten from host to Vortex device addresses. */
    case nir_intrinsic_load_ssbo:
    case nir_intrinsic_load_ubo: {
+      /* The acceleration-structure address (lavapipe's unbounded ubo read) is
+       * a constant-bank operand on NVIDIA: each query uses it without a
+       * dependent load. Vortex has no constant bank, so read it once in the
+       * entry block. Other constants stay at their use: hoisting them all
+       * raises register pressure on the 32-register ISA and adds spills. */
+      LLVMBasicBlockRef use_block = NULL;
+      if (in->intrinsic == nir_intrinsic_load_ubo && t->arg &&
+          nir_intrinsic_range(in) == -1 &&
+          nir_src_is_const(in->src[0]) && nir_src_is_const(in->src[1]) &&
+          t->entry && LLVMGetInsertBlock(t->b) != t->entry &&
+          LLVMGetBasicBlockTerminator(t->entry)) {
+         use_block = LLVMGetInsertBlock(t->b);
+         LLVMPositionBuilderBefore(t->b, LLVMGetBasicBlockTerminator(t->entry));
+      }
       LLVMValueRef base;
       if (in->intrinsic == nir_intrinsic_load_ubo &&
           nir_src_is_const(in->src[0])) {
@@ -2007,6 +2021,8 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
             value = emit_uniform(t, value);
          ssa_set(t, in->def.index, c, value);
       }
+      if (use_block)
+         LLVMPositionBuilderAtEnd(t->b, use_block);
       break;
    }
    case nir_intrinsic_get_ssbo_size: {
