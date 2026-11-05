@@ -683,15 +683,15 @@ intrinsic("rq_load", src_comp=[-1], dest_comp=0, indices=[RAY_QUERY_VALUE,COMMIT
 
 # Vortex RTU (ray-tracing unit) vendor intrinsics. The vortexpipe Gallium
 # driver lowers rq_*/trace_ray to these (vp_nir_lower_ray_tracing_to_rtu.c)
-# and emits them as Vortex CUSTOM1 .insn ops (vp_nir_to_llvm.c). BASE is the
-# RTU register-file slot id (see sw/kernel/include/vx_raytrace.h).
-# v2 window ABI (rtu_isa_v2_proposal.md): vortex_rt_wtrace issues one ray in a
-# single macro-op — the per-trace config (scene, flags|cull<<16) lane-packs via
-# wgather and the per-thread geometry (origin, dir, tmin, tmax) rides the f0..f7
-# register window. vortex_rt_wait blocks on the handle. vortex_rt_get reads one
-# hit slot post-terminal (GETW, scoreboard-chained on the wait status, src[0]).
+# and emits explicit-register field instructions for the RTU (vp_nir_to_llvm.c).
+# BASE is an RT register-window slot. vortex_rt_wtrace submits one ray after
+# all its fields have arrived. vortex_rt_wait blocks on the handle, and
+# vortex_rt_get reads a hit slot ordered after its status dependency, src[0].
 #                                  scene flags|cull origin dir tmin tmax
 intrinsic("vortex_rt_wtrace", src_comp=[1,1,3,3,1,1], dest_comp=1)  # -> handle
+# Absolute root address/extent prepared by the shader's fresh-query path.
+# Resuming a suspended traversal consumes its continuation instead of a root.
+intrinsic("vortex_rt_wtrace_prepared", src_comp=[1,1,3,3,1,1,2], dest_comp=1)
 intrinsic("vortex_rt_wait",  src_comp=[1], dest_comp=1)            # handle -> status
 # Attribute reads leave query state unchanged; retain ordering against RT calls.
 intrinsic("vortex_rt_get",    src_comp=[1], dest_comp=1, indices=[BASE], flags=[CAN_ELIMINATE])

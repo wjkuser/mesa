@@ -1553,7 +1553,8 @@ emit_deref(struct vp_tr *t, nir_deref_instr *d)
 static LLVMValueRef emit_vx_rt_get(struct vp_tr *t, unsigned slot, LLVMValueRef status);
 static LLVMValueRef emit_vx_rt_wtrace(struct vp_tr *t, LLVMValueRef scene,
                                       LLVMValueRef flags_cull,
-                                      LLVMValueRef ray[8]);
+                                      LLVMValueRef ray[8], LLVMValueRef root,
+                                      LLVMValueRef bytes);
 static LLVMValueRef emit_vx_rt_wait(struct vp_tr *t, LLVMValueRef handle);
 static LLVMValueRef emit_rt_control(struct vp_tr *t, unsigned operation,
                                     LLVMValueRef handle, LLVMValueRef action);
@@ -1802,9 +1803,13 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
 {
    switch (in->intrinsic) {
    case nir_intrinsic_shader_clock: {
+      /* Captured native clock2x32ARB waits on scoreboard SB0 before reading
+       * SR_CLOCK. WSYNC conservatively drains older warp instructions here;
+       * it does not model the native scoreboard's individual barrier slots. */
       if (LLVMGetIntTypeWidth(t->iptr) == 64) {
          LLVMTypeRef type = LLVMFunctionType(t->i64, NULL, 0, false);
-         char code[] = "csrr $0, 0xb00", constraints[] = "=r,~{memory}";
+         char code[] = ".insn r 11, 7, 0, x0, x0, x0\n\tcsrr $0, 0xb00",
+              constraints[] = "=r,~{memory}";
          LLVMValueRef function = LLVMGetInlineAsm(type, code, strlen(code),
             constraints, strlen(constraints), true, false, LLVMInlineAsmDialectATT, false);
          LLVMValueRef cycles = LLVMBuildCall2(t->b, type, function, NULL, 0, "cycles");
@@ -1816,7 +1821,9 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          LLVMTypeRef result_type = LLVMStructTypeInContext(t->ctx, fields, 3, false);
          LLVMTypeRef type = LLVMFunctionType(result_type, NULL, 0, false);
          /* The cycle counter is warp-uniform; retry across low-word rollover. */
-         char code[] = "1: csrr $0, 0xb80; csrr $1, 0xb00; csrr $2, 0xb80; bne $0, $2, 1b";
+         char code[] = ".insn r 11, 7, 0, x0, x0, x0; "
+                       "1: csrr $0, 0xb80; csrr $1, 0xb00; "
+                       "csrr $2, 0xb80; bne $0, $2, 1b";
          char constraints[] = "=&r,=&r,=&r,~{memory}";
          LLVMValueRef function = LLVMGetInlineAsm(type, code, strlen(code),
             constraints, strlen(constraints), true, false, LLVMInlineAsmDialectATT, false);
@@ -2193,6 +2200,8 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
             LLVMConstInt(t->i64, c * esz, false), "");
          LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
          LLVMValueRef value = vp_load_mem(t, in->def.bit_size, p, "push");
+         LLVMSetMetadata(value, LLVMGetMDKindIDInContext(t->ctx, "invariant.load", 14),
+            LLVMMetadataAsValue(t->ctx, LLVMMDNodeInContext2(t->ctx, NULL, 0)));
          if (nir_src_is_const(in->src[0]))
             value = emit_uniform(t, value);
          ssa_set(t, in->def.index, c, value);
@@ -2208,7 +2217,14 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
             LLVMConstInt(LLVMTypeOf(addr), c * esz, false), "");
          LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
-         ssa_set(t, in->def.index, c, vp_load_mem(t, in->def.bit_size, p, "gld"));
+         LLVMValueRef value = vp_load_mem(t, in->def.bit_size, p, "gld");
+         if (in->intrinsic == nir_intrinsic_load_global_constant) {
+            LLVMSetMetadata(value,
+               LLVMGetMDKindIDInContext(t->ctx, "invariant.load", 14),
+               LLVMMetadataAsValue(t->ctx,
+                  LLVMMDNodeInContext2(t->ctx, NULL, 0)));
+         }
+         ssa_set(t, in->def.index, c, value);
       }
       break;
    }
@@ -2548,7 +2564,8 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       ssa_set(t, in->def.index, 0, emit_vx_rt_get(t, slot, status));
       break;
    }
-   case nir_intrinsic_vortex_rt_wtrace: {
+   case nir_intrinsic_vortex_rt_wtrace:
+   case nir_intrinsic_vortex_rt_wtrace_prepared: {
       /* src = { scene, flags|cull, origin(3), dir(3), tmin, tmax } */
       LLVMValueRef scene = ssa_get(t, in->src[0].ssa->index, 0);
       LLVMValueRef fc    = ssa_get(t, in->src[1].ssa->index, 0);
@@ -2562,7 +2579,10 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          ssa_get(t, in->src[4].ssa->index, 0),   /* tmin     */
          ssa_get(t, in->src[5].ssa->index, 0),   /* tmax     */
       };
-      ssa_set(t, in->def.index, 0, emit_vx_rt_wtrace(t, scene, fc, ray));
+      bool prepared = in->intrinsic == nir_intrinsic_vortex_rt_wtrace_prepared;
+      LLVMValueRef root = prepared ? ssa_get(t, in->src[6].ssa->index, 0) : NULL;
+      LLVMValueRef bytes = prepared ? ssa_get(t, in->src[6].ssa->index, 1) : NULL;
+      ssa_set(t, in->def.index, 0, emit_vx_rt_wtrace(t, scene, fc, ray, root, bytes));
       break;
    }
    case nir_intrinsic_vortex_rt_wait: {
@@ -2570,10 +2590,44 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       ssa_set(t, in->def.index, 0, emit_vx_rt_wait(t, h));
       break;
    }
-   case nir_intrinsic_vortex_rt_event_wait:
+   case nir_intrinsic_vortex_rt_event_wait: {
+#ifdef VP_HACKRTCORE
+      /* Expand the event intrinsic at the ISA boundary. All classification
+       * instructions execute on the SM, using the returned type/count and
+       * signed distance. Keep the expansion together with its dependency wait,
+       * like the multi-instruction request intrinsic below. */
+      char assembly[768];
+      snprintf(assembly, sizeof assembly,
+         ".insn r 43, 7, 2, $0, $4, x0\n\t"
+         ".insn r 43, 6, %u, $1, $0, x1\n\t"
+         "srli $2, $0, 25\n\t"
+         "xori $2, $2, %u\n\t"
+         "seqz $2, $2\n\t"
+         "andi $3, $0, %u\n\t"
+         "snez $3, $3\n\t"
+         "and $2, $2, $3\n\t"
+         "not $0, $0\n\t"
+         "and $0, $0, $1\n\t"
+         "srli $0, $0, 31\n\t"
+         "addi $2, $2, %u\n\t"
+         "sub $0, $2, $0",
+         (VX_RT_HIT_T << 2) | 3, VX_RT_RESULT_PROCEDURAL >> 25,
+         VX_RT_RESULT_COUNT_MASK, VX_RT_EVENT_COMPLETE);
+      LLVMTypeRef outputs[] = {t->i32, t->i32, t->i32, t->i32};
+      LLVMTypeRef result_type = LLVMStructTypeInContext(t->ctx, outputs, 4, false);
+      LLVMTypeRef type = LLVMFunctionType(result_type, &t->i32, 1, false);
+      const char *constraints = "=&r,=&r,=&r,=&r,r,~{memory}";
+      LLVMValueRef instruction = LLVMGetInlineAsm(type, assembly, strlen(assembly),
+         constraints, strlen(constraints), true, false, LLVMInlineAsmDialectATT, false);
+      LLVMValueRef handle = ssa_get(t, in->src[0].ssa->index, 0);
+      LLVMValueRef words = LLVMBuildCall2(t->b, type, instruction, &handle, 1, "rt_words");
+      ssa_set(t, in->def.index, 0, LLVMBuildExtractValue(t->b, words, 0, "rt_event"));
+#else
       ssa_set(t, in->def.index, 0, emit_rt_control(t, 2,
          ssa_get(t, in->src[0].ssa->index, 0), LLVMConstInt(t->i32, 0, false)));
+#endif
       break;
+   }
    case nir_intrinsic_vortex_rt_action:
       ssa_set(t, in->def.index, 0, emit_rt_control(t, 3,
          ssa_get(t, in->src[0].ssa->index, 0), ssa_get(t, in->src[1].ssa->index, 0)));
@@ -3126,7 +3180,10 @@ emit_vx_rt_get(struct vp_tr *t, unsigned slot, LLVMValueRef status)
                     ((slot & 0x1f) << 2) | (floating ? 2u : 3u), (slot & 32) ? 17 : 1);
    LLVMTypeRef args[1] = { t->i32 };
    LLVMTypeRef fnty = LLVMFunctionType(floating ? t->f32 : t->i32, args, 1, false);
-   const char *constraints = floating ? "=f,r,~{memory}" : "=r,r,~{memory}";
+   const char *constraints = floating ? "=f,r" : "=r,r";
+   /* This reads mutable RT-window state, not a pure function of status.
+    * A reused status value must not let machine LICM hoist the read across
+    * SET/WAIT operations. Unused reads can be removed by NIR before emission. */
    LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, (size_t)n, constraints, strlen(constraints),
                                       /*HasSideEffects*/ true, false,
                                       LLVMInlineAsmDialectATT, false);
@@ -3135,25 +3192,32 @@ emit_vx_rt_get(struct vp_tr *t, unsigned slot, LLVMValueRef status)
    return floating ? LLVMBuildBitCast(t->b, value, t->i32, "") : value;
 }
 
-/* vx_rt_trace: rd = handle <- trace(rs1 = lane-packed config; f0..f7 = ray).
- * config = wgather(0, scene, 0, flags|cull): lane1=scene, lane2=payload(0),
- * lane3=flags|cull (the RTU reads rs1 lanes 1/2/3). The eight ray floats
- * are bound to f0..f7 — read by HW convention, like the tensor unit's fragment
- * window; the encoding itself only names rd/rs1, so the window operands ride
- * the operand list unreferenced. SSA values are i32 bit-patterns, so the ray
- * geometry is bitcast to float to land in the FP registers. */
+/* The RTU path names every field operand; the legacy graphics path below uses
+ * WGATHER and the fixed FP window. NIR ray values are integer bit patterns. */
 static LLVMValueRef
 emit_vx_rt_wtrace(struct vp_tr *t, LLVMValueRef scene, LLVMValueRef flags_cull,
-                  LLVMValueRef ray[8])
+                  LLVMValueRef ray[8], LLVMValueRef root, LLVMValueRef bytes)
 {
 #ifdef VP_HACKRTCORE
-   LLVMValueRef ptr = LLVMBuildIntToPtr(t->b, scene, t->ptr, "rt_scene");
-   LLVMValueRef offset = LLVMConstInt(t->i32, 2, false);
-   LLVMValueRef size_ptr = LLVMBuildGEP2(t->b, t->i32, ptr, &offset, 1, "");
-   LLVMValueRef root = LLVMBuildLoad2(t->b, t->i32, ptr, "rt_root");
-   LLVMValueRef bytes = LLVMBuildLoad2(t->b, t->i32, size_ptr, "rt_bytes");
-   const char *s = ".insn r 43, 7, 4, $0, $1, $2";
-   const char *c = "=&r,r,r,{a2},{a3},{f0},{f1},{f2},{f3},{f4},{f5},{f6},{f7},~{memory}";
+   if (!root) {
+      LLVMValueRef ptr = LLVMBuildIntToPtr(t->b, scene, t->ptr, "rt_scene");
+      LLVMValueRef offset = LLVMConstInt(t->i32, 2, false);
+      LLVMValueRef size_ptr = LLVMBuildGEP2(t->b, t->i32, ptr, &offset, 1, "");
+      root = LLVMBuildLoad2(t->b, t->i32, ptr, "rt_root");
+      root = LLVMBuildAdd(t->b, scene, root, "rt_root_address");
+      LLVMValueRef kind_offset = LLVMConstInt(t->i32, 1, false);
+      LLVMValueRef kind_ptr = LLVMBuildGEP2(t->b, t->i32, ptr, &kind_offset, 1, "");
+      LLVMValueRef kind = LLVMBuildLoad2(t->b, t->i32, kind_ptr, "rt_root_format");
+      root = LLVMBuildOr(t->b, root, kind, "rt_root_descriptor");
+      bytes = LLVMBuildLoad2(t->b, t->i32, size_ptr, "rt_bytes");
+   }
+   /* Explicit field operands let register allocation keep ray values in their
+    * producer registers, as CP_WRITE does. The final field starts traversal. */
+   const char *s = ".insn r4 91, 0, 0, $0, $1, $2, $3\n\t"
+                   ".insn r4 91, 1, 0, x0, $5, $6, $7\n\t"
+                   ".insn r4 91, 2, 0, x0, $8, $9, $10\n\t"
+                   ".insn r4 91, 4, 0, x0, $11, $12, $4";
+   const char *c = "=&r,r,r,r,r,f,f,f,f,f,f,f,f,~{memory}";
    LLVMTypeRef args[12] = {t->i32, t->i32, t->i32, t->i32};
    LLVMValueRef a[12] = {scene, flags_cull, root, bytes};
    for (unsigned i = 0; i < 8; ++i) {
@@ -3190,6 +3254,8 @@ emit_rt_control(struct vp_tr *t, unsigned operation, LLVMValueRef handle, LLVMVa
 {
    char assembly[64];
    snprintf(assembly, sizeof assembly, ".insn r 43, 7, %u, $0, $1, $2", operation);
+   /* Traversal can access the context/spill range supplied through the RT
+    * window. The scalar handle does not describe those memory effects to LLVM. */
    const char *constraints = "=r,r,r,~{memory}";
    LLVMTypeRef args[2] = {t->i32, t->i32};
    LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 2, false);
@@ -3221,7 +3287,8 @@ emit_vx_rt_wait(struct vp_tr *t, LLVMValueRef handle)
    const char *s = ".insn r 43, 7, 1, $0, $1, x0";
    LLVMTypeRef args[1] = { t->i32 };
    LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 1, false);
-   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), "=r,r", 4,
+   const char *constraints = "=r,r,~{memory}";
+   LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), constraints, strlen(constraints),
                                       /*HasSideEffects*/ true, false,
                                       LLVMInlineAsmDialectATT, false);
    LLVMValueRef a[1] = { handle };

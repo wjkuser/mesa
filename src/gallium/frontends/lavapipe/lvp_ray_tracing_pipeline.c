@@ -893,7 +893,7 @@ lvp_rtu_instance(nir_builder *b, struct lvp_ray_tracing_state *state,
                  nir_def *query, nir_def *scene, bool committed)
 {
    nir_def *id = lvp_rtu_query_value(b, query, nir_ray_query_value_intersection_instance_id, committed);
-   nir_def *table = nir_build_load_global(b, 1, 32,
+   nir_def *table = nir_build_load_global_constant(b, 1, 32,
       nir_iadd_imm(b, scene, RTU_SCENE_INSTANCE_TABLE_OFFSET));
    nir_def *address = nir_iadd(b, scene, nir_u2u64(b,
       nir_iadd(b, table, nir_imul_imm(b, id, RTU_INSTANCE_METADATA_BYTES))));
@@ -1203,7 +1203,8 @@ lvp_shader_wto_matrix(nir_builder *b, nir_def *address, nir_def *rows[3])
 {
 #ifdef VP_HACKRTCORE
    for (unsigned r = 0; r < 3; ++r)
-      rows[r] = nir_build_load_global(b, 4, 32, nir_iadd_imm(b, address, 48 + r * 16));
+      rows[r] = nir_build_load_global_constant(
+         b, 4, 32, nir_iadd_imm(b, address, 48 + r * 16));
 #else
    lvp_load_wto_matrix(b, address, NULL, rows);
 #endif
@@ -1358,7 +1359,7 @@ lvp_lower_ray_tracing_instr(nir_builder *b, nir_instr *instr, void *data)
       matrix_offset = offsetof(struct lvp_bvh_instance_node, otw_matrix);
 #endif
       for (unsigned r = 0; r < 3; ++r)
-         rows[r] = nir_build_load_global(
+         rows[r] = nir_build_load_global_constant(
             b, 4, 32,
             nir_iadd_imm(b, instance_node_addr, matrix_offset + r * 16));
       def = nir_vec3(b, nir_channel(b, rows[0], c), nir_channel(b, rows[1], c), nir_channel(b, rows[2], c));
@@ -1513,6 +1514,24 @@ lvp_compile_ray_tracing_pipeline(struct lvp_pipeline *pipeline,
 
    NIR_PASS(_, b->shader, nir_lower_returns);
 
+#ifdef VP_HACKRTCORE
+   /* Inline depth-1 TraceRay stages before vars-to-SSA. Keeping stage
+    * boundaries as NIR functions until after SSA leaves the merged ray state
+    * live across too many control-flow joins and forces it to scratch. A
+    * depth-1 TraceRay pipeline needs no nested TraceRay continuation. Callable
+    * continuations retain their explicit nir_lower_shader_calls frames. */
+   if (create_info->maxPipelineRayRecursionDepth <= 1) {
+      nir_foreach_function(func, b->shader) {
+         if (!func->is_entrypoint)
+            func->should_inline = true;
+      }
+      NIR_PASS(_, b->shader, nir_inline_functions);
+      nir_remove_non_entrypoints(b->shader);
+      NIR_PASS(_, b->shader, nir_opt_copy_prop_vars);
+      lvp_shader_optimize(b->shader);
+   }
+#endif
+
    const struct nir_lower_compute_system_values_options compute_system_values = {0};
    NIR_PASS(_, b->shader, nir_lower_compute_system_values, &compute_system_values);
    NIR_PASS(_, b->shader, nir_lower_global_vars_to_local);
@@ -1540,7 +1559,8 @@ lvp_compile_ray_tracing_pipeline(struct lvp_pipeline *pipeline,
 
 #ifdef VP_HACKRTCORE
    /* Keep cross-stage state in scratch before inlining stage functions. */
-   if (!compiler.callable_size && !pipeline->rt.dynamic_stack_size) {
+   if (create_info->maxPipelineRayRecursionDepth > 1 &&
+       !compiler.callable_size && !pipeline->rt.dynamic_stack_size) {
       nir_foreach_function(func, b->shader) {
          if (!func->is_entrypoint)
             func->should_inline = true;
