@@ -151,6 +151,9 @@ vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
    const char *gnu_dir = is64 ? "riscv64-gnu-toolchain" : "riscv32-gnu-toolchain";
    const char *march   = is64 ? "rv64imafd" : "rv32imaf";
    const char *mabi    = is64 ? "lp64d"     : "ilp32f";
+   /* RV32 medlow covers all addresses and lets LLVM rematerialize constant
+    * bases. Kernels are statically linked at their actual launch address. */
+   const char *code_model = is64 ? "medany" : "medlow";
    const char *linker  = is64 ? "link64.ld" : "link32.ld";
    const char *libc    = is64 ? "libc64"    : "libc32";
    const char *libcrt  = is64 ? "libcrt64"  : "libcrt32";
@@ -176,9 +179,9 @@ vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
    cache_path[0] = '\0';
    if (cache_enabled) {
       char cfg[1024];
-      snprintf(cfg, sizeof cfg, "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%llx|%d",
+      snprintf(cfg, sizeof cfg, "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%llx|%d|%s",
                simt_options, td, vh, bd, target, gnu_dir, march, mabi,
-               linker, libc, libcrt, startup_addr, link_gfx_sw ? 1 : 0);
+               linker, libc, libcrt, startup_addr, link_gfx_sw ? 1 : 0, code_model);
       uint64_t key = vp_hash(0xcbf29ce484222325ull, cfg, strlen(cfg));
       key = vp_hash(key, llvm_ir, strlen(llvm_ir));
       char inputs[2][1024];
@@ -270,7 +273,7 @@ vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
             "-Xclang -target-feature -Xclang +zicond "
             "-mllvm -disable-loop-idiom-all %s "
             "-Wno-unused-command-line-argument -Wno-override-module "
-            "-O3 -mcmodel=medany -nostartfiles -nostdlib "
+            "-O3 -mcmodel=%s -nostartfiles -nostdlib "
             "-fdata-sections -ffunction-sections -fuse-ld=lld "
             "%s %s "
             "-Wl,-Bstatic,--gc-sections,-T,%s/sw/kernel/scripts/%s,"
@@ -284,6 +287,7 @@ vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
             td, gnu_dir,
             march, mabi,
             simt_options,
+            code_model,
             p_ll, gfx_seg,
             vh, linker,
             startup_addr,

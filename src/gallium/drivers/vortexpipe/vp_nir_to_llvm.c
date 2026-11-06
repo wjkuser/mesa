@@ -177,6 +177,7 @@ struct vp_tr {
     * For a deref instr, component 0 holds the iptr byte address. */
    LLVMValueRef  *val;
    unsigned       nval;
+   bool           preserve_fp32_denorms;
    BITSET_WORD *float_types;
    /* vertex-shader state (is_vs only) */
    bool           is_vs;
@@ -324,6 +325,20 @@ emit_fsqrt(struct vp_tr *t, LLVMValueRef fa)
    if (!fn)
       fn = LLVMAddFunction(t->mod, "llvm.sqrt.f32", fty);
    return LLVMBuildCall2(t->b, fty, fn, &fa, 1, "fsqrt");
+}
+
+/* Reciprocal-square-root uses the target's special-function pipeline. */
+static LLVMValueRef
+emit_frsq(struct vp_tr *t, LLVMValueRef value)
+{
+   if (t->preserve_fp32_denorms)
+      return LLVMBuildFDiv(t->b, LLVMConstReal(t->f32, 1.0),
+                           emit_fsqrt(t, value), "frsq_preserve");
+   LLVMTypeRef type = LLVMFunctionType(t->f32, &t->f32, 1, false);
+   const char code[] = ".insn r 11, 0, 7, $0, $1, x0";
+   LLVMValueRef fn = LLVMGetInlineAsm(type, code, strlen(code), "=f,f", 4,
+      false, false, LLVMInlineAsmDialectATT, false);
+   return LLVMBuildCall2(t->b, type, fn, &value, 1, "frsq");
 }
 
 /* llvm.ctlz.i32 (count leading zeros, zero-is-not-poison) -> Vortex clz. */
@@ -1159,8 +1174,8 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
          if (alu->op == nir_op_fsqrt) {
             res = emit_fsqrt(t, fa);
          } else if (alu->op == nir_op_frsq) {
-            res = LLVMBuildFDiv(t->b, LLVMConstReal(ft, 1.0),
-                                emit_fsqrt(t, fa), "frsq");
+            res = bs == 32 && !t->preserve_fp32_denorms ? emit_frsq(t, fa) :
+               LLVMBuildFDiv(t->b, LLVMConstReal(ft, 1.0), emit_fsqrt(t, fa), "frsq");
          } else if (alu->op == nir_op_fneg) {
             res = LLVMBuildFNeg(t->b, fa, "");
          } else if (alu->op == nir_op_fabs) {
@@ -1184,7 +1199,14 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
                                   nir_src_is_const(alu->src[1].src)
                ? (float)nir_src_comp_as_float(alu->src[1].src, alu->src[1].swizzle[c]) : 0.0f;
             const float reciprocal = 1.0f / divisor;
-            if (divisor != 0.0f && isfinite(reciprocal))
+            nir_alu_instr *denom = alu->op == nir_op_fdiv &&
+               alu->src[1].src.ssa->parent_instr->type == nir_instr_type_alu
+               ? nir_instr_as_alu(alu->src[1].src.ssa->parent_instr) : NULL;
+            if (bs == 32 && !t->preserve_fp32_denorms && !alu->exact &&
+                denom && denom->op == nir_op_fsqrt && !denom->exact) {
+               LLVMValueRef square = as_float(t, alu_src(t, denom, 0, alu->src[1].swizzle[c]), bs);
+               res = LLVMBuildFMul(t->b, fa, emit_frsq(t, square), "normalized");
+            } else if (divisor != 0.0f && isfinite(reciprocal))
                res = LLVMBuildFMul(t->b, fa, LLVMConstReal(ft, reciprocal), "");
             else if (alu->op == nir_op_fdiv)
                res = LLVMBuildFDiv(t->b, fa, fb, "");
@@ -2009,6 +2031,11 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
             LLVMConstInt(t->i64, c * esz, false), "");
          LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
+         /* A fixed word in a raw UBO upload has the same immutable address
+          * for every invocation. Keep this memory-space fact through LLVM. */
+         if (in->intrinsic == nir_intrinsic_load_ubo &&
+             nir_src_is_const(in->src[0]) && nir_src_is_const(in->src[1]))
+            p = LLVMBuildAddrSpaceCast(t->b, p, LLVMPointerTypeInContext(t->ctx, 4), "constant_ptr");
          LLVMValueRef value = vp_load_mem(t, in->def.bit_size, p, "buf");
          /* Raw slots address private uploads, not descriptor-backed resources
           * that may alias shader writes. Their contents stay fixed at launch. */
@@ -2199,6 +2226,8 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          LLVMValueRef a = LLVMBuildAdd(t->b, addr,
             LLVMConstInt(t->i64, c * esz, false), "");
          LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
+         if (nir_src_is_const(in->src[0]))
+            p = LLVMBuildAddrSpaceCast(t->b, p, LLVMPointerTypeInContext(t->ctx, 4), "constant_ptr");
          LLVMValueRef value = vp_load_mem(t, in->def.bit_size, p, "push");
          LLVMSetMetadata(value, LLVMGetMDKindIDInContext(t->ctx, "invariant.load", 14),
             LLVMMetadataAsValue(t->ctx, LLVMMDNodeInContext2(t->ctx, NULL, 0)));
@@ -6048,6 +6077,8 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
 
 #endif
    struct vp_tr t = {0};
+   t.preserve_fp32_denorms = nir_is_denorm_preserve(
+      nir->info.float_controls_execution_mode, 32);
    t.ok    = true;
    t.is_vs = (nir->info.stage == MESA_SHADER_VERTEX);
    t.is_fs = (nir->info.stage == MESA_SHADER_FRAGMENT);
