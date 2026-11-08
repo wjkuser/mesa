@@ -149,6 +149,7 @@ can_remat_instr(nir_instr *instr, struct sized_bitset *remat)
       case nir_intrinsic_load_vulkan_descriptor:
       case nir_intrinsic_load_push_constant:
       case nir_intrinsic_load_global_constant:
+      case nir_intrinsic_load_const_buf_base_addr_lvp:
          /* These intrinsics don't need to be spilled as long as they don't
           * depend on any spilled values.
           */

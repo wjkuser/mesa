@@ -220,6 +220,26 @@ lvp_nir_fixup_indirect_tex(nir_shader *shader)
 static void
 optimize(nir_shader *nir)
 {
+#ifdef VP_HACKRTCORE
+   /* Cloning a suspension site gives its continuations different PCs and
+    * prevents lanes from regrouping at the same native shader resume point. */
+   if (nir->info.stage == MESA_SHADER_RAYGEN) {
+      nir_foreach_function_impl(impl, nir) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+               if (op != nir_intrinsic_trace_ray && op != nir_intrinsic_execute_callable)
+                  continue;
+               for (nir_cf_node *cf = block->cf_node.parent; cf; cf = cf->parent)
+                  if (cf->type == nir_cf_node_loop)
+                     nir_cf_node_as_loop(cf)->control = nir_loop_control_dont_unroll;
+            }
+         }
+      }
+   }
+#endif
    bool progress = false;
    do {
       progress = false;

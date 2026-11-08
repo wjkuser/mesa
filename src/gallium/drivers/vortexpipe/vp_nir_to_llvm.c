@@ -338,7 +338,15 @@ emit_frsq(struct vp_tr *t, LLVMValueRef value)
    const char code[] = ".insn r 11, 0, 7, $0, $1, x0";
    LLVMValueRef fn = LLVMGetInlineAsm(type, code, strlen(code), "=f,f", 4,
       false, false, LLVMInlineAsmDialectATT, false);
-   return LLVMBuildCall2(t->b, type, fn, &value, 1, "frsq");
+   LLVMValueRef result = LLVMBuildCall2(t->b, type, fn, &value, 1, "frsq");
+   /* RSQ consumes only its register operand and has no memory effects. */
+   LLVMAddCallSiteAttribute(result, LLVMAttributeFunctionIndex,
+      LLVMCreateEnumAttribute(t->ctx,
+         LLVMGetEnumAttributeKindForName("memory", 6), 0));
+   LLVMAddCallSiteAttribute(result, LLVMAttributeFunctionIndex,
+      LLVMCreateEnumAttribute(t->ctx,
+         LLVMGetEnumAttributeKindForName("willreturn", 10), 0));
+   return result;
 }
 
 /* llvm.ctlz.i32 (count leading zeros, zero-is-not-poison) -> Vortex clz. */
@@ -537,10 +545,10 @@ emit_bitreverse(struct vp_tr *t, LLVMValueRef v)
  * a warp bitmask (bit i = lane i's predicate). Side-effecting so the optimizer
  * cannot hoist it across the divergent control flow whose mask it reports. */
 static LLVMValueRef
-emit_ballot(struct vp_tr *t, LLVMValueRef pred_i32)
+emit_vote(struct vp_tr *t, LLVMValueRef pred_i32, unsigned operation)
 {
    char s[48];
-   int n = snprintf(s, sizeof s, ".insn r %u, 3, 1, $0, $1, x0", VP_RISCV_CUSTOM0);
+   int n = snprintf(s, sizeof s, ".insn r %u, %u, 1, $0, $1, x0", VP_RISCV_CUSTOM0, operation);
    LLVMTypeRef args[1] = { t->i32 };
    LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 1, false);
    LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, (size_t)n, "=r,r", 4,
@@ -551,7 +559,28 @@ emit_ballot(struct vp_tr *t, LLVMValueRef pred_i32)
    LLVMAddCallSiteAttribute(call, LLVMAttributeFunctionIndex,
       LLVMCreateEnumAttribute(t->ctx,
          LLVMGetEnumAttributeKindForName("convergent", 10), 0));
-   return call;
+   return emit_uniform(t, call);
+}
+
+static LLVMValueRef
+emit_ballot(struct vp_tr *t, LLVMValueRef predicate)
+{
+   return emit_vote(t, predicate, 3);
+}
+
+/* Whole-warp unsigned integer reduction, including inactive-lane masking. */
+static LLVMValueRef
+emit_reduce_min(struct vp_tr *t, LLVMValueRef value)
+{
+   char assembly[] = ".insn r 11, 0, 5, $0, $1, x0";
+   LLVMTypeRef type = LLVMFunctionType(t->i32, &t->i32, 1, false);
+   LLVMValueRef intrinsic = LLVMGetInlineAsm(type, assembly, sizeof(assembly) - 1,
+      "=r,r", 4, true, false, LLVMInlineAsmDialectATT, false);
+   LLVMValueRef result = LLVMBuildCall2(t->b, type, intrinsic, &value, 1, "reduce_min");
+   LLVMAddCallSiteAttribute(result, LLVMAttributeFunctionIndex,
+      LLVMCreateEnumAttribute(t->ctx,
+         LLVMGetEnumAttributeKindForName("convergent", 10), 0));
+   return emit_uniform(t, result);
 }
 
 /* vx shuffle (custom-0, funct7=1): rd = value from a source lane selected by
@@ -1016,6 +1045,10 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
          LLVMValueRef res = alu->op == nir_op_fadd
             ? LLVMBuildFAdd(t->b, a, b, "fadd")
             : LLVMBuildFMul(t->b, a, b, "fmul");
+         /* Preserve NIR's reassociation, contraction and signed-zero permissions. */
+         if (!alu->exact && LLVMIsAInstruction(res))
+            LLVMSetFastMathFlags(res, LLVMFastMathAllowContract | LLVMFastMathAllowReassoc |
+               (nir_alu_instr_is_signed_zero_preserve(alu) ? 0 : LLVMFastMathNoSignedZeros));
          r = from_float(t, res, bs);
          break;
       }
@@ -1224,6 +1257,11 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
                res = LLVMBuildCall2(t->b, type, fn, args, 3, "fma");
             }
          }
+         /* Division lowering can also produce a contractible multiply. */
+         if (alu->op == nir_op_fdiv && !alu->exact &&
+             LLVMIsAInstruction(res) && LLVMGetInstructionOpcode(res) == LLVMFMul)
+            LLVMSetFastMathFlags(res, LLVMFastMathAllowContract | LLVMFastMathAllowReassoc |
+               (nir_alu_instr_is_signed_zero_preserve(alu) ? 0 : LLVMFastMathNoSignedZeros));
          r = from_float(t, res, bs);
          break;
       }
@@ -1558,7 +1596,10 @@ emit_deref(struct vp_tr *t, nir_deref_instr *d)
       if (!base || !idx) { t->ok = false; return; }
       LLVMValueRef off = LLVMBuildMul(t->b, vp_to_iptr(t, idx),
          vp_iptr_const(t, glsl_bytes(d->type)), "");
-      addr = LLVMBuildAdd(t->b, base, off, "elem");
+      /* Preserve pointer provenance so private arrays can be scalarized. */
+      LLVMValueRef ptr = LLVMBuildIntToPtr(t->b, base, t->ptr, "");
+      ptr = LLVMBuildGEP2(t->b, t->i8, ptr, &off, 1, "elem");
+      addr = LLVMBuildPtrToInt(t->b, ptr, t->iptr, "");
       break;
    }
    default:
@@ -1964,6 +2005,9 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
     *    (a struct lp_descriptor / lp_jit_buffer); the buffer's data
     *    pointer is the first 8 bytes of that descriptor, so the access
     *    dereferences one level: data = *(i64*)desc + offset.
+    * Pipeline-layout lowering uses 32-bit slot indices and 64-bit descriptor
+    * addresses. Continuation PHIs may hide a constant slot, so distinguish
+    * the representations by width, not by whether the source is constant.
     * vp_launch builds the device descriptor buffer with these pointer
     * fields rewritten from host to Vortex device addresses. */
    case nir_intrinsic_load_ssbo:
@@ -1984,7 +2028,7 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       }
       LLVMValueRef base;
       if (in->intrinsic == nir_intrinsic_load_ubo &&
-          nir_src_is_const(in->src[0])) {
+          nir_src_bit_size(in->src[0]) == 32) {
          /* Constant-buffer index form: base = arg[index] read directly. Push
           * constants (load_ubo(0, off)) take this path (src[0] is the constant
           * 0); the compute acceleration-structure read load_ubo(1, 0) does too
@@ -1999,15 +2043,15 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
             base = LLVMConstInt(t->i64, 0, false);
          }
       } else if (in->intrinsic == nir_intrinsic_load_ssbo &&
-                 nir_src_is_const(in->src[0])) {
+                 nir_src_bit_size(in->src[0]) == 32) {
          /* Raw shader-buffer slot: a constant src[0] is a set_shader_buffers
           * binding index (not a descriptor address), so its data base is
           * arg[VP_ARG_SSBO_BASE + slot] directly — no descriptor dereference.
           * lavapipe binds the RT trace-ray command buffer this way and reads it
           * as load_ssbo(imm 0, off); vp_launch relocates it into that arg slot. */
-         unsigned slot = (unsigned)nir_src_as_uint(in->src[0]);
-         if (t->arg && slot < VP_MAX_SSBO) {
-            LLVMValueRef idx = LLVMConstInt(t->i64, VP_ARG_SSBO_BASE + slot, false);
+         if (t->arg) {
+            LLVMValueRef idx = LLVMBuildAdd(t->b, intr_src(t, in, 0),
+               LLVMConstInt(t->i32, VP_ARG_SSBO_BASE, false), "ssboslot");
             LLVMValueRef gep = LLVMBuildGEP2(t->b, t->i64, t->arg, &idx, 1, "");
             base = LLVMBuildLoad2(t->b, t->i64, gep, "ssbobase");
          } else {
@@ -2077,10 +2121,10 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
        * operand 1 is a raw shader-buffer slot: its data base is
        * arg[VP_ARG_SSBO_BASE + slot] directly (see load_ssbo). */
       LLVMValueRef base;
-      if (nir_src_is_const(in->src[1])) {
-         unsigned slot = (unsigned)nir_src_as_uint(in->src[1]);
-         if (t->arg && slot < VP_MAX_SSBO) {
-            LLVMValueRef idx = LLVMConstInt(t->i64, VP_ARG_SSBO_BASE + slot, false);
+      if (nir_src_bit_size(in->src[1]) == 32) {
+         if (t->arg) {
+            LLVMValueRef idx = LLVMBuildAdd(t->b, intr_src(t, in, 1),
+               LLVMConstInt(t->i32, VP_ARG_SSBO_BASE, false), "ssboslot");
             LLVMValueRef gep = LLVMBuildGEP2(t->b, t->i64, t->arg, &idx, 1, "");
             base = LLVMBuildLoad2(t->b, t->i64, gep, "ssbobase");
          } else {
@@ -2395,22 +2439,16 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       ssa_set(t, in->def.index, 0,
               emit_shfl_idx(t, intr_src(t, in, 0), intr_src(t, in, 1)));
       break;
-   /* vote_all / vote_any: reduce a per-lane predicate over the ACTIVE lanes.
-    * active = ballot(1); votes = ballot(pred). all = (votes & active)==active;
-    * any = (votes & active)!=0. Restricting to the active mask is what makes the
-    * result correct under divergence. */
+   /* Hardware votes operate on the instruction's active lane mask. */
    case nir_intrinsic_vote_all:
    case nir_intrinsic_vote_any: {
       LLVMValueRef pred = intr_src(t, in, 0);
       if (LLVMTypeOf(pred) == LLVMInt1TypeInContext(t->ctx))
          pred = LLVMBuildZExt(t->b, pred, t->i32, "");
-      LLVMValueRef active = emit_ballot(t, LLVMConstInt(t->i32, 1, false));
-      LLVMValueRef votes  = LLVMBuildAnd(t->b, emit_ballot(t, pred), active, "");
-      LLVMValueRef r = in->intrinsic == nir_intrinsic_vote_all
-         ? LLVMBuildICmp(t->b, LLVMIntEQ, votes, active, "vote_all")
-         : LLVMBuildICmp(t->b, LLVMIntNE, votes,
-                         LLVMConstInt(t->i32, 0, false), "vote_any");
-      ssa_set(t, in->def.index, 0, r);
+      LLVMValueRef vote = emit_vote(t, pred,
+         in->intrinsic == nir_intrinsic_vote_all ? 0 : 1);
+      ssa_set(t, in->def.index, 0, LLVMBuildICmp(t->b, LLVMIntNE, vote,
+         LLVMConstInt(t->i32, 0, false), "vote"));
       break;
    }
    /* vote_ieq / vote_feq: true iff src[0] is equal across all active lanes.
@@ -2475,6 +2513,10 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          break;
       }
       nir_op rop  = nir_intrinsic_reduction_op(in);
+      if (in->intrinsic == nir_intrinsic_reduce && !cluster && rop == nir_op_umin) {
+         ssa_set(t, in->def.index, 0, emit_reduce_min(t, intr_src(t, in, 0)));
+         break;
+      }
       LLVMValueRef incl = emit_subgroup_incl_scan(t, rop, intr_src(t, in, 0),
                                                   cluster);
       if (!t->ok)
@@ -2560,9 +2602,9 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       if (!addr) { t->ok = false; break; }
       unsigned    esz = in->def.bit_size / 8u;
       for (unsigned c = 0; c < in->def.num_components; c++) {
-         LLVMValueRef a = LLVMBuildAdd(t->b, addr,
-            vp_iptr_const(t, c * esz), "");
-         LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
+         LLVMValueRef offset = vp_iptr_const(t, c * esz);
+         LLVMValueRef p = LLVMBuildIntToPtr(t->b, addr, t->ptr, "");
+         p = LLVMBuildGEP2(t->b, t->i8, p, &offset, 1, "");
          ssa_set(t, in->def.index, c, vp_load_mem(t, in->def.bit_size, p, "ld"));
       }
       break;
@@ -2578,9 +2620,9 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
             continue;
          LLVMValueRef v = ssa_get(t, in->src[1].ssa->index, c);
          if (!v) { t->ok = false; break; }
-         LLVMValueRef a = LLVMBuildAdd(t->b, addr,
-            vp_iptr_const(t, c * esz), "");
-         LLVMValueRef p = LLVMBuildIntToPtr(t->b, a, t->ptr, "");
+         LLVMValueRef offset = vp_iptr_const(t, c * esz);
+         LLVMValueRef p = LLVMBuildIntToPtr(t->b, addr, t->ptr, "");
+         p = LLVMBuildGEP2(t->b, t->i8, p, &offset, 1, "");
          LLVMBuildStore(t->b, vp_store_mem_val(t, nir_src_bit_size(in->src[1]), v), p);
       }
       break;
