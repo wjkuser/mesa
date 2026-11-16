@@ -499,6 +499,7 @@ lvp_pipeline_types_from_shader_stages(VkShaderStageFlags stageFlags)
 
 struct lvp_ray_tracing_group_handle {
    uint32_t index;
+   uint32_t any_hit;
 };
 
 struct lvp_ray_tracing_group {

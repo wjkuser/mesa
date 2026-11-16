@@ -86,6 +86,7 @@ free_memory(struct pipe_screen *screen, struct pipe_memory_allocation *allocatio
       entry = &(*entry)->next;
    *entry = mem->next;
    simple_mtx_unlock(&vps->resident_lock);
+   vp_as_evict(screen, (uintptr_t)mem->backing.cpu_addr, mem->backing.size);
    vx_buffer_release(mem->buffer);
    release_backing(vps, mem);
    free(mem);

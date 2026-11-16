@@ -24,6 +24,11 @@ struct vp_context {
    void (*lp_set_constant_buffer)(struct pipe_context *, enum pipe_shader_type,
                                  unsigned, bool, const struct pipe_constant_buffer *);
    void (*lp_context_destroy)(struct pipe_context *);
+   void (*lp_resource_copy_region)(struct pipe_context *, struct pipe_resource *,
+                                   unsigned, unsigned, unsigned, unsigned,
+                                   struct pipe_resource *, unsigned, const struct pipe_box *);
+   void (*lp_clear_buffer)(struct pipe_context *, struct pipe_resource *,
+                           unsigned, unsigned, const void *, int);
    unsigned launches;
 };
 

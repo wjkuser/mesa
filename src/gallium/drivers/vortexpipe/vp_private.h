@@ -109,6 +109,7 @@ struct vp_screen {
    simple_mtx_t        resident_lock;
    uint64_t            next_program_address;
    void (*lp_resource_destroy)(struct pipe_screen *, struct pipe_resource *);
+   struct vp_as_resident *as_resident;
 };
 
 /* One host allocation's device-resident mirror. `host_base`/`size` describe the
@@ -167,7 +168,8 @@ bool vp_screen_has_rtu(struct pipe_screen *screen);
  * that takes, all of which the asynchronous uploads still read, so vp_as_end
  * belongs after vx_queue_finish and nowhere earlier. */
 struct vp_as_ctx;
-struct vp_as_ctx *vp_as_begin(vx_device_h dev, vx_queue_h q, bool has_rtu);
+struct vp_as_ctx *vp_as_begin(struct pipe_screen *screen, vx_queue_h q, bool has_rtu);
+void vp_as_evict(struct pipe_screen *screen, uintptr_t base, uint64_t size);
 uint64_t vp_as_relocate(struct vp_as_ctx *c, uint64_t tlas_host);
 bool vp_as_ok(const struct vp_as_ctx *c);
 void vp_as_end(struct vp_as_ctx *c);

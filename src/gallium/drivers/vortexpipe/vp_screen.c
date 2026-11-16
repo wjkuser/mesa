@@ -239,6 +239,7 @@ vp_resource_destroy(struct pipe_screen *screen, struct pipe_resource *pres)
    const uint8_t *base = NULL;
    uint32_t size = 0;
    if (vps->dev && vp_resource_host_range(pres, &base, &size)) {
+      vp_as_evict(screen, (uintptr_t)base, size);
       vp_resident_evict_range(vps, base, size);
    }
    vps->lp_resource_destroy(screen, pres);
@@ -257,6 +258,7 @@ vp_screen_destroy(struct pipe_screen *screen)
     * after vps has been freed. */
    screen->resource_destroy = vps->lp_resource_destroy;
    vp_memory_finish(screen);
+   vp_as_evict(screen, 0, UINT64_MAX);
    for (unsigned i = 0; i < vps->n_resident; i++) {
       vx_buffer_release(vps->resident[i].buf);
    }

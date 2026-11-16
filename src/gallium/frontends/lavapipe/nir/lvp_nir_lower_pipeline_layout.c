@@ -182,8 +182,20 @@ lower_load_ubo(nir_builder *b, nir_intrinsic_instr *intrin, void *data_cb)
 static void
 lower_push_constant(nir_builder *b, nir_intrinsic_instr *intrin, void *data_cb)
 {
+   const struct lvp_pipeline_layout *layout = data_cb;
+   unsigned access = 0;
+   /* A statically addressed load inside the allocated push-constant block
+    * cannot fault when moved out of conditional control flow. Preserve that
+    * property when representing push constants as UBO zero. */
+   if (nir_src_is_const(intrin->src[0])) {
+      uint64_t end = nir_src_as_uint(intrin->src[0]) +
+                     (uint64_t)intrin->def.num_components * (intrin->def.bit_size / 8);
+      if (end <= layout->push_constant_size)
+         access = ACCESS_CAN_SPECULATE;
+   }
    nir_def *load = nir_load_ubo(b, intrin->def.num_components, intrin->def.bit_size,
                                 nir_imm_int(b, 0), intrin->src[0].ssa,
+                                .access = access,
                                 .range = nir_intrinsic_range(intrin));
    nir_def_rewrite_uses(&intrin->def, load);
    nir_instr_remove(&intrin->instr);
@@ -264,6 +276,8 @@ void lvp_lower_pipeline_layout(const struct lvp_device *device,
                                struct lvp_pipeline_layout *layout,
                                nir_shader *shader)
 {
+   /* Resolve constant address arithmetic introduced by explicit IO. */
+   NIR_PASS_V(shader, nir_opt_constant_folding);
    nir_shader_intrinsics_pass(shader, lower_load_ubo,
                               nir_metadata_control_flow,
                               layout);

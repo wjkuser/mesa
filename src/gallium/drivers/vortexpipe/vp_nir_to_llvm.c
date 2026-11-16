@@ -349,6 +349,28 @@ emit_frsq(struct vp_tr *t, LLVMValueRef value)
    return result;
 }
 
+/* Reciprocal uses the target's special-function pipeline. */
+static LLVMValueRef
+emit_frcp(struct vp_tr *t, LLVMValueRef value)
+{
+   if (t->preserve_fp32_denorms)
+      return LLVMBuildFDiv(t->b, LLVMConstReal(t->f32, 1.0),
+                           value, "frcp_preserve");
+   LLVMTypeRef type = LLVMFunctionType(t->f32, &t->f32, 1, false);
+   const char code[] = ".insn r 11, 1, 7, $0, $1, x0";
+   LLVMValueRef fn = LLVMGetInlineAsm(type, code, strlen(code), "=f,f", 4,
+      false, false, LLVMInlineAsmDialectATT, false);
+   LLVMValueRef result = LLVMBuildCall2(t->b, type, fn, &value, 1, "frcp");
+   /* RCP consumes only its register operand and has no memory effects. */
+   LLVMAddCallSiteAttribute(result, LLVMAttributeFunctionIndex,
+      LLVMCreateEnumAttribute(t->ctx,
+         LLVMGetEnumAttributeKindForName("memory", 6), 0));
+   LLVMAddCallSiteAttribute(result, LLVMAttributeFunctionIndex,
+      LLVMCreateEnumAttribute(t->ctx,
+         LLVMGetEnumAttributeKindForName("willreturn", 10), 0));
+   return result;
+}
+
 /* llvm.ctlz.i32 (count leading zeros, zero-is-not-poison) -> Vortex clz. */
 static LLVMValueRef
 emit_ctlz(struct vp_tr *t, LLVMValueRef v)
@@ -1025,6 +1047,17 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
          r = LLVMBuildAdd(t->b, alu_src(t, alu, 0, c),
                                 alu_src(t, alu, 1, c), "iadd");
          break;
+      case nir_op_uadd_sat: {
+         LLVMTypeRef type = LLVMIntTypeInContext(t->ctx, alu->def.bit_size);
+         LLVMValueRef original = alu_src(t, alu, 0, c);
+         LLVMValueRef a = vp_int_cast(t, original, type);
+         LLVMValueRef b = vp_int_cast(t, alu_src(t, alu, 1, c), type);
+         LLVMValueRef sum = LLVMBuildAdd(t->b, a, b, "");
+         LLVMValueRef overflow = LLVMBuildICmp(t->b, LLVMIntULT, sum, a, "");
+         r = LLVMBuildSelect(t->b, overflow, LLVMConstAllOnes(type), sum, "uadd_sat");
+         r = vp_int_cast(t, r, LLVMTypeOf(original));
+         break;
+      }
       case nir_op_imul:
          r = LLVMBuildMul(t->b, alu_src(t, alu, 0, c),
                                 alu_src(t, alu, 1, c), "imul");
@@ -1072,7 +1105,8 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
          r = LLVMBuildNot(t->b, alu_src(t, alu, 0, c), "inot");
          break;
       case nir_op_ishr: {
-         LLVMValueRef v = alu_src(t, alu, 0, c);
+         LLVMValueRef v = norm_int_src(t, alu_src(t, alu, 0, c),
+                                      alu->def.bit_size, true);
          LLVMValueRef shift = LLVMBuildAnd(t->b,
             vp_int_cast(t, alu_src(t, alu, 1, c), LLVMTypeOf(v)),
             LLVMConstInt(LLVMTypeOf(v), alu->def.bit_size - 1, false), "");
@@ -1081,7 +1115,8 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
          break;
       }
       case nir_op_ushr: {
-         LLVMValueRef v = alu_src(t, alu, 0, c);
+         LLVMValueRef v = norm_int_src(t, alu_src(t, alu, 0, c),
+                                      alu->def.bit_size, false);
          LLVMValueRef shift = LLVMBuildAnd(t->b,
             vp_int_cast(t, alu_src(t, alu, 1, c), LLVMTypeOf(v)),
             LLVMConstInt(LLVMTypeOf(v), alu->def.bit_size - 1, false), "");
@@ -1241,6 +1276,11 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
                res = LLVMBuildFMul(t->b, fa, emit_frsq(t, square), "normalized");
             } else if (divisor != 0.0f && isfinite(reciprocal))
                res = LLVMBuildFMul(t->b, fa, LLVMConstReal(ft, reciprocal), "");
+            else if (alu->op == nir_op_fdiv && bs == 32 &&
+                     !alu->exact && !t->preserve_fp32_denorms)
+               /* With reciprocal transformation permitted, use the native
+                * reciprocal/multiply sequence and its respective pipelines. */
+               res = LLVMBuildFMul(t->b, fa, emit_frcp(t, fb), "quotient");
             else if (alu->op == nir_op_fdiv)
                res = LLVMBuildFDiv(t->b, fa, fb, "");
             else if (alu->op == nir_op_fmin || alu->op == nir_op_fmax)
@@ -1403,26 +1443,29 @@ emit_alu(struct vp_tr *t, nir_alu_instr *alu)
                 LLVMConstInt(t->i32, sh, false), "i2i");
          break;
       }
-      /* high 32 bits of a 32x32 multiply */
       case nir_op_umul_high: case nir_op_imul_high: {
-         LLVMTypeRef ext = t->i64;
-         LLVMValueRef a = alu->op == nir_op_umul_high
-            ? LLVMBuildZExt(t->b, alu_src(t, alu, 0, c), ext, "")
-            : LLVMBuildSExt(t->b, alu_src(t, alu, 0, c), ext, "");
-         LLVMValueRef b = alu->op == nir_op_umul_high
-            ? LLVMBuildZExt(t->b, alu_src(t, alu, 1, c), ext, "")
-            : LLVMBuildSExt(t->b, alu_src(t, alu, 1, c), ext, "");
+         unsigned bits = alu->def.bit_size;
+         LLVMTypeRef word = LLVMIntTypeInContext(t->ctx, bits);
+         LLVMTypeRef ext = LLVMIntTypeInContext(t->ctx, 2 * bits);
+         LLVMValueRef original = alu_src(t, alu, 0, c);
+         LLVMValueRef a = vp_int_cast(t, original, word);
+         LLVMValueRef b = vp_int_cast(t, alu_src(t, alu, 1, c), word);
+         a = alu->op == nir_op_umul_high
+            ? LLVMBuildZExt(t->b, a, ext, "") : LLVMBuildSExt(t->b, a, ext, "");
+         b = alu->op == nir_op_umul_high
+            ? LLVMBuildZExt(t->b, b, ext, "") : LLVMBuildSExt(t->b, b, ext, "");
          r = LLVMBuildTrunc(t->b,
             LLVMBuildLShr(t->b, LLVMBuildMul(t->b, a, b, ""),
-                          LLVMConstInt(ext, 32, false), ""), t->i32, "mulhi");
+                          LLVMConstInt(ext, bits, false), ""), word, "mulhi");
+         r = vp_int_cast(t, r, LLVMTypeOf(original));
          break;
       }
       /* float reciprocal */
       case nir_op_frcp: {
          unsigned bs = alu->def.bit_size;
-         r = from_float(t,
-            LLVMBuildFDiv(t->b, LLVMConstReal(cty(t, bs), 1.0),
-               as_float(t, alu_src(t, alu, 0, c), bs), ""), bs);
+         LLVMValueRef value = as_float(t, alu_src(t, alu, 0, c), bs);
+         r = from_float(t, bs == 32 ? emit_frcp(t, value) :
+            LLVMBuildFDiv(t->b, LLVMConstReal(cty(t, bs), 1.0), value, ""), bs);
          break;
       }
       /* ufind_msb: index of the highest set bit, -1 when the source is 0.
@@ -1883,9 +1926,11 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          LLVMTypeRef fields[] = {t->i32, t->i32, t->i32};
          LLVMTypeRef result_type = LLVMStructTypeInContext(t->ctx, fields, 3, false);
          LLVMTypeRef type = LLVMFunctionType(result_type, NULL, 0, false);
-         /* The cycle counter is warp-uniform; retry across low-word rollover. */
+         /* Native S2UR reads the high counter word into a uniform register.
+          * Wait for that result before reading the low word; retry on rollover.
+          * 0x7e1 selects the uniform read interface, independent of its latency. */
          char code[] = ".insn r 11, 7, 0, x0, x0, x0; "
-                       "1: csrr $0, 0xb80; csrr $1, 0xb00; "
+                       "1: csrr $0, 0x7e1; .insn r 11, 7, 0, x0, x0, x0; csrr $1, 0xb00; "
                        "csrr $2, 0xb80; bne $0, $2, 1b";
          char constraints[] = "=&r,=&r,=&r,~{memory}";
          LLVMValueRef function = LLVMGetInlineAsm(type, code, strlen(code),
@@ -2037,8 +2082,20 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
           * compute) is a descriptor dereference — the else branch below. */
          if (t->arg) {
             LLVMValueRef idx = intr_src(t, in, 0);
+            LLVMBasicBlockRef base_use = LLVMGetInsertBlock(t->b);
+            bool fixed_slot = nir_src_is_const(in->src[0]);
+            if (fixed_slot && base_use != t->entry &&
+                LLVMGetBasicBlockTerminator(t->entry))
+               LLVMPositionBuilderBefore(t->b, LLVMGetBasicBlockTerminator(t->entry));
             LLVMValueRef gep = LLVMBuildGEP2(t->b, t->i64, t->arg, &idx, 1, "");
             base = LLVMBuildLoad2(t->b, t->i64, gep, "ubobase");
+            if (fixed_slot) {
+               LLVMSetMetadata(base, LLVMGetMDKindIDInContext(t->ctx, "invariant.load", 14),
+                  LLVMMetadataAsValue(t->ctx, LLVMMDNodeInContext2(t->ctx, NULL, 0)));
+               base = emit_uniform(t, base);
+            }
+            if (LLVMGetInsertBlock(t->b) != base_use)
+               LLVMPositionBuilderAtEnd(t->b, base_use);
          } else {
             base = LLVMConstInt(t->i64, 0, false);
          }
@@ -3282,6 +3339,21 @@ emit_vx_rt_wtrace(struct vp_tr *t, LLVMValueRef scene, LLVMValueRef flags_cull,
       root = LLVMBuildOr(t->b, root, kind, "rt_root_descriptor");
       bytes = LLVMBuildLoad2(t->b, t->i32, size_ptr, "rt_bytes");
    }
+   /* SM constructs the two primitive-opacity action fields consumed by RTU.
+    * Public Vulkan flags are mutually exclusive in this group. The request
+    * preserves other control bits and the cull mask. */
+   LLVMValueRef opaque_action = LLVMBuildOr(t->b,
+      LLVMBuildAnd(t->b, flags_cull, LLVMConstInt(t->i32, 2, false), ""),
+      LLVMBuildAnd(t->b, LLVMBuildLShr(t->b, flags_cull,
+         LLVMConstInt(t->i32, 6, false), ""), LLVMConstInt(t->i32, 1, false), ""), "");
+   LLVMValueRef alpha_action = LLVMBuildOr(t->b,
+      LLVMBuildShl(t->b, LLVMBuildAnd(t->b, flags_cull,
+         LLVMConstInt(t->i32, 1, false), ""), LLVMConstInt(t->i32, 7, false), ""),
+      LLVMBuildAnd(t->b, LLVMBuildLShr(t->b, flags_cull,
+         LLVMConstInt(t->i32, 1, false), ""), LLVMConstInt(t->i32, 64, false), ""), "");
+   flags_cull = LLVMBuildOr(t->b,
+      LLVMBuildAnd(t->b, flags_cull, LLVMConstInt(t->i32, ~0xc3u, false), ""),
+      LLVMBuildOr(t->b, opaque_action, alpha_action, ""), "rt_primitive_actions");
    /* Explicit field operands let register allocation keep ray values in their
     * producer registers, as CP_WRITE does. The final field starts traversal. */
    const char *s = ".insn r4 91, 0, 0, $0, $1, $2, $3\n\t"
@@ -4694,6 +4766,116 @@ emit_instr(struct vp_tr *t, nir_instr *instr)
    return t->ok;
 }
 
+/* Dense subgroup-uniform target selection uses a code-address table. The
+ * loaded address is the branch operand; normal memory dependencies apply. */
+static void
+lower_uniform_dispatch_tables(struct vp_tr *t, LLVMValueRef fn)
+{
+   for (LLVMBasicBlockRef head = LLVMGetFirstBasicBlock(fn); head;
+        head = LLVMGetNextBasicBlock(head)) {
+      LLVMValueRef term = LLVMGetBasicBlockTerminator(head);
+      if (!term || !LLVMIsABranchInst(term) || !LLVMIsConditional(term))
+         continue;
+      LLVMValueRef cmp = LLVMGetCondition(term);
+      if (!LLVMIsAICmpInst(cmp) || LLVMGetICmpPredicate(cmp) != LLVMIntEQ)
+         continue;
+      LLVMValueRef key = LLVMGetOperand(cmp, 0);
+      if (!LLVMIsACallInst(key))
+         continue;
+      LLVMValueRef callee = LLVMGetCalledValue(key);
+      size_t name_size;
+      const char *name = LLVMGetValueName2(callee, &name_size);
+      const char *prefix = "llvm.riscv.vx.uniform.";
+      if (name_size < strlen(prefix) || strncmp(name, prefix, strlen(prefix)))
+         continue;
+      LLVMValueRef election = LLVMGetOperand(key, 0);
+      if (!LLVMIsACallInst(election)) continue;
+      LLVMValueRef operation = LLVMGetCalledValue(election);
+      if (!LLVMIsAInlineAsm(operation)) continue;
+      size_t assembly_size;
+      const char *assembly = LLVMGetInlineAsmAsmString(operation, &assembly_size);
+      const char *reduce = ".insn r 11, 0, 5, $0, $1, x0";
+      if (assembly_size != strlen(reduce) || memcmp(assembly, reduce, assembly_size))
+         continue;
+      struct { uint64_t index; LLVMBasicBlockRef target; } cases[64];
+      unsigned count = 0;
+      uint64_t low = UINT64_MAX, high = 0;
+      LLVMBasicBlockRef tail = head, fallback = NULL;
+      while (count < ARRAY_SIZE(cases)) {
+         term = LLVMGetBasicBlockTerminator(tail);
+         if (!term || !LLVMIsABranchInst(term) || !LLVMIsConditional(term))
+            break;
+         cmp = LLVMGetCondition(term);
+         if (!LLVMIsAICmpInst(cmp) || LLVMGetICmpPredicate(cmp) != LLVMIntEQ ||
+             LLVMGetOperand(cmp, 0) != key ||
+             !LLVMIsAConstantInt(LLVMGetOperand(cmp, 1)))
+            break;
+         LLVMUseRef use = LLVMGetFirstUse(cmp);
+         if (!use || LLVMGetNextUse(use) || LLVMGetUser(use) != term)
+            break;
+         /* Intermediate tests must not contain computations skipped by the
+          * table. PHIs at destinations would need edge-specific operands. */
+         if (tail != head && (LLVMGetFirstInstruction(tail) != cmp ||
+                              LLVMGetNextInstruction(cmp) != term))
+            break;
+         LLVMBasicBlockRef target = LLVMGetSuccessor(term, 0);
+         if (LLVMIsAPHINode(LLVMGetFirstInstruction(target)))
+            break;
+         uint64_t index = LLVMConstIntGetZExtValue(LLVMGetOperand(cmp, 1));
+         bool duplicate = false;
+         for (unsigned i = 0; i < count; ++i)
+            duplicate |= cases[i].index == index;
+         if (duplicate) break;
+         cases[count].index = index;
+         cases[count++].target = target;
+         low = MIN2(low, index);
+         high = MAX2(high, index);
+         fallback = LLVMGetSuccessor(term, 1);
+         tail = fallback;
+      }
+      if (count < 3 || high - low >= 2 * count ||
+          LLVMIsAPHINode(LLVMGetFirstInstruction(fallback)))
+         continue;
+      unsigned entries = high - low + 1;
+      LLVMValueRef addresses[128];
+      for (unsigned i = 0; i < entries; ++i)
+         addresses[i] = LLVMBlockAddress(fn, fallback);
+      for (unsigned i = 0; i < count; ++i)
+         addresses[cases[i].index - low] = LLVMBlockAddress(fn, cases[i].target);
+      LLVMTypeRef array_type = LLVMArrayType(t->ptr, entries);
+      LLVMValueRef table = LLVMAddGlobal(t->mod, array_type, "uniform_targets");
+      LLVMSetLinkage(table, LLVMInternalLinkage);
+      LLVMSetGlobalConstant(table, true);
+      LLVMSetInitializer(table, LLVMConstArray(t->ptr, addresses, entries));
+      LLVMSetAlignment(table, t->iptr == t->i64 ? 8 : 4);
+      LLVMInstructionEraseFromParent(LLVMGetBasicBlockTerminator(head));
+      LLVMPositionBuilderAtEnd(t->b, head);
+      LLVMValueRef index = LLVMBuildSub(t->b, key,
+         LLVMConstInt(LLVMTypeOf(key), low, false), "target_index");
+      LLVMValueRef valid = LLVMBuildICmp(t->b, LLVMIntULT, index,
+         LLVMConstInt(LLVMTypeOf(key), entries, false), "target_in_range");
+      LLVMBasicBlockRef lookup = LLVMAppendBasicBlockInContext(t->ctx, fn,
+                                                               "target_lookup");
+      LLVMBuildCondBr(t->b, valid, lookup, fallback);
+      LLVMPositionBuilderAtEnd(t->b, lookup);
+      LLVMValueRef indices[] = { LLVMConstInt(t->i32, 0, false), index };
+      LLVMValueRef slot = LLVMBuildGEP2(t->b, array_type, table, indices, 2,
+                                        "target_slot");
+      LLVMValueRef address = LLVMBuildLoad2(t->b, t->ptr, slot, "target_address");
+      LLVMValueRef branch = LLVMBuildIndirectBr(t->b, address, count + 1);
+      LLVMAddDestination(branch, fallback);
+      for (unsigned i = 0; i < count; ++i) {
+         bool seen = cases[i].target == fallback;
+         for (unsigned j = 0; j < i; ++j)
+            seen |= cases[i].target == cases[j].target;
+         if (!seen) LLVMAddDestination(branch, cases[i].target);
+      }
+      /* Tests retained as unreachable blocks are removed by normal LLVM CFG
+       * simplification. Their original true edges preserve existing PHIs. */
+      head = tail;
+   }
+}
+
 /* Translate a function's control-flow graph. One LLVM basic block per
  * NIR block; the branch out of each is taken straight from NIR's
  * per-block successors -- a following nir_if becomes a conditional
@@ -6064,6 +6246,14 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
       memset(out_vs, 0, sizeof *out_vs);
    if (!nir)
       return false;
+   /* Integer division uses reciprocal estimation, multiplication and exact
+    * remainder correction on GPU arithmetic pipelines. */
+   NIR_PASS(_, nir, nir_opt_idiv_const, 8);
+   const nir_lower_idiv_options idiv_options = { .allow_fp16 = false };
+   NIR_PASS(_, nir, nir_lower_idiv, &idiv_options);
+   NIR_PASS(_, nir, nir_opt_constant_folding);
+   NIR_PASS(_, nir, nir_opt_cse);
+   NIR_PASS(_, nir, nir_opt_dce);
    /* Local storage is emitted as scalar/vector/array allocations. */
    NIR_PASS(_, nir, nir_split_struct_vars, nir_var_function_temp);
    NIR_PASS(_, nir, nir_remove_dead_derefs);
@@ -6383,6 +6573,7 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
        * index-resolve merge block (cont_bb), not the original entry, which the
        * index-buffer branch already terminated. */
       emit_cfg(&t, impl, fn, LLVMGetInsertBlock(t.b));
+      if (t.ok) lower_uniform_dispatch_tables(&t, fn);
 
       free(t.val);
       t.val = NULL;
@@ -6405,6 +6596,17 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
        * it by name (kernel_main -> "main"). The KMU launches __vx_cta_entry,
        * which brings up the C environment and dispatches to the kernel
        * address it reads from VX_CSR_CTA_ENTRY. */
+      unsigned max_threads = 1024;
+      if (nir->info.stage == MESA_SHADER_COMPUTE && !nir->info.workgroup_size_variable) {
+         max_threads = MAX2(nir->info.workgroup_size[0], 1) *
+                       MAX2(nir->info.workgroup_size[1], 1) *
+                       MAX2(nir->info.workgroup_size[2], 1);
+      }
+      char bounds[16];
+      snprintf(bounds, sizeof(bounds), "%u", max_threads);
+      const char *attr = "vortex-max-workgroup-threads";
+      LLVMAddAttributeAtIndex(kfn, LLVMAttributeFunctionIndex,
+         LLVMCreateStringAttribute(t.ctx, attr, strlen(attr), bounds, strlen(bounds)));
       emit_kernel_annotation(&t, kfn);
    }
 

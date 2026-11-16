@@ -16,6 +16,8 @@
 
 #define _GNU_SOURCE
 #include "vp_launch.h"
+#include "vortex.h"
+#include "launch_constants.h"
 #include "vp_memory.h"
 #include "vp_private.h"        /* vp_screen_resident_addr */
 #ifdef VP_HACKRTCORE
@@ -93,6 +95,7 @@
 /* Device buffers + host staging blobs created while copying one
  * acceleration structure's BVHs; both must outlive vx_queue_finish. */
 struct vp_as_ctx {
+   struct pipe_screen *screen;
    vx_device_h dev;
    vx_queue_h  q;
    vx_buffer_h bufs[VP_MAX_BVH];
@@ -102,6 +105,100 @@ struct vp_as_ctx {
    bool        has_rtu;   /* transcode AS to RTU scene instead of verbatim copy */
    bool        ok;
 };
+
+/* A derived AS image belongs to its source allocation. Compare the complete
+ * transcode so TLAS and referenced BLAS updates both refresh device contents. */
+struct vp_as_resident {
+   uintptr_t source;
+   uint8_t *bytes;
+   uint32_t size;
+   vx_buffer_h buffer;
+   uint64_t address;
+   struct vp_as_resident *next;
+};
+
+void
+vp_as_evict(struct pipe_screen *screen, uintptr_t base, uint64_t size)
+{
+   struct vp_screen *vps = vp_reg_get(screen);
+   simple_mtx_lock(&vps->resident_lock);
+   struct vp_as_resident **link = &vps->as_resident;
+   while (*link) {
+      struct vp_as_resident *entry = *link;
+      if (entry->source >= base && entry->source - base < size) {
+         *link = entry->next;
+         vx_buffer_release(entry->buffer);
+         free(entry->bytes);
+         free(entry);
+      } else {
+         link = &entry->next;
+      }
+   }
+   simple_mtx_unlock(&vps->resident_lock);
+}
+
+static uint64_t
+vp_as_resident_address(struct vp_as_ctx *c, const void *source,
+                       uint8_t *scene, uint32_t size)
+{
+   struct vp_screen *vps = vp_reg_get(c->screen);
+   simple_mtx_lock(&vps->resident_lock);
+   struct vp_as_resident **link = &vps->as_resident;
+   while (*link && (*link)->source != (uintptr_t)source)
+      link = &(*link)->next;
+   struct vp_as_resident *entry = *link;
+   if (entry && entry->size == size && !memcmp(entry->bytes, scene, size)) {
+      vx_buffer_retain(entry->buffer);
+      c->bufs[c->n_bufs++] = entry->buffer;
+      uint64_t address = entry->address;
+      simple_mtx_unlock(&vps->resident_lock);
+      free(scene);
+      return address;
+   }
+
+   /* The dispatch retains the staging bytes until its asynchronous upload
+    * completes. The residency entry owns a separate comparison snapshot. */
+   struct vp_as_resident *fresh = calloc(1, sizeof(*fresh));
+   if (!fresh) goto fail;
+   fresh->bytes = malloc(size);
+   if (!fresh->bytes) goto fail;
+   if (entry && entry->size == size) {
+      fresh->buffer = entry->buffer;
+      fresh->address = entry->address;
+      vx_buffer_retain(fresh->buffer);
+   } else if (vx_buffer_create(c->dev, size, VX_MEM_READ, &fresh->buffer) != VX_SUCCESS ||
+              vx_buffer_address(fresh->buffer, &fresh->address) != VX_SUCCESS) {
+      goto fail;
+   }
+   memcpy(fresh->bytes, scene, size);
+   fresh->source = (uintptr_t)source;
+   fresh->size = size;
+   if (vx_enqueue_write(c->q, fresh->buffer, 0, scene, size, 0, NULL, NULL) != VX_SUCCESS)
+      goto fail;
+   fresh->next = entry ? entry->next : NULL;
+   *link = fresh;
+   if (entry) {
+      vx_buffer_release(entry->buffer);
+      free(entry->bytes);
+      free(entry);
+   }
+   vx_buffer_retain(fresh->buffer);
+   c->bufs[c->n_bufs++] = fresh->buffer;
+   c->stages[c->n_stages++] = scene;
+   uint64_t address = fresh->address;
+   simple_mtx_unlock(&vps->resident_lock);
+   return address;
+fail:
+   if (fresh) {
+      if (fresh->buffer) vx_buffer_release(fresh->buffer);
+      free(fresh->bytes);
+      free(fresh);
+   }
+   simple_mtx_unlock(&vps->resident_lock);
+   free(scene);
+   c->ok = false;
+   return 0;
+}
 
 /* Copy one lavapipe BVH (TLAS or BLAS) into Vortex device memory and
  * return its device address. A TLAS's instance nodes carry absolute
@@ -616,20 +713,7 @@ vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
    if (c->n_bufs >= VP_MAX_BVH || c->n_stages >= VP_MAX_BVH) {
       free(scene); c->ok = false; return 0;
    }
-   /* The upload is asynchronous; keep `scene` alive until the queue
-    * finishes (freed by the launch cleanup, like vp_copy_as's stages). */
-   c->stages[c->n_stages++] = scene;
-   vx_buffer_h b = NULL;
-   uint64_t dev_addr = 0;
-   if (vx_buffer_create(c->dev, size, VX_MEM_READ, &b) != VX_SUCCESS) {
-      c->ok = false; return 0;
-   }
-   c->bufs[c->n_bufs++] = b;
-   if (vx_buffer_address(b, &dev_addr) != VX_SUCCESS ||
-       vx_enqueue_write(c->q, b, 0, scene, size, 0, NULL, NULL) != VX_SUCCESS) {
-      c->ok = false; return 0;
-   }
-   return dev_addr;
+   return vp_as_resident_address(c, tlas_host, scene, size);
 }
 
 /* A draw reaches its descriptors through its own loops and tears them down at
@@ -638,13 +722,14 @@ vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
  * the copy allocates has to outlive vx_queue_finish, and handing out the struct
  * would make that lifetime the caller's to reconstruct rather than to observe. */
 struct vp_as_ctx *
-vp_as_begin(vx_device_h dev, vx_queue_h q, bool has_rtu)
+vp_as_begin(struct pipe_screen *screen, vx_queue_h q, bool has_rtu)
 {
    struct vp_as_ctx *c = calloc(1, sizeof *c);
    if (!c) {
       return NULL;
    }
-   c->dev     = dev;
+   c->screen  = screen;
+   c->dev     = ((struct vp_screen *)vp_reg_get(screen))->dev;
    c->q       = q;
    c->has_rtu = has_rtu;
    c->ok      = true;
@@ -743,6 +828,7 @@ vp_launch(struct pipe_screen *screen, vx_device_h dev,
       .priority = VX_QUEUE_PRIORITY_NORMAL, .flags = 0,
    };
    VP_CHECK(vx_queue_create(dev, &qi, &q), "vx_queue_create");
+   asc.screen = screen;
    asc.dev = dev;
    asc.q   = q;
    asc.has_rtu = has_rtu;
@@ -973,6 +1059,10 @@ vp_launch(struct pipe_screen *screen, vx_device_h dev,
       .block_dim = { block[0], block[1], block[2] },
       .lmem_size = lmem_size,
    };
+   /* Bind the uploaded constant range for pre-dispatch cache preparation. */
+   VP_CHECK(vx_dcr_write(dev, VX_DCR_CONSTANT_ADDR_LO, (uint32_t)desc_dev), "constant address low");
+   VP_CHECK(vx_dcr_write(dev, VX_DCR_CONSTANT_ADDR_HI, (uint32_t)(desc_dev >> 32)), "constant address high");
+   VP_CHECK(vx_dcr_write(dev, VX_DCR_CONSTANT_BYTES, desc_bytes), "constant byte count");
    VP_CHECK(vx_enqueue_launch(q, &li, 0, NULL, NULL), "vx_enqueue_launch");
 
    /* copy every written buffer back into its host backing */

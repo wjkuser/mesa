@@ -447,9 +447,6 @@ typedef struct nir_variable {
        */
       unsigned ray_query : 1;
 
-      /** Traversal state remains in the Vortex RTU between candidate events. */
-      unsigned rtu_resident_query : 1;
-
       /**
        * Precision qualifier.
        *

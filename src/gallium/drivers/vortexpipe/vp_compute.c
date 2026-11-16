@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "vp_private.h"
+#include "vortex.h"
 #include "vp_compile.h"
 #include "vp_launch.h"
 #include "util/log.h"
@@ -78,16 +79,8 @@ static void *create_compute_state(struct pipe_context *pipe,
    }
    cso->lmem_size = nir->info.shared_size;
    cso->scratch_size = nir->scratch_size;
+   /* Taking a scratch pointer preserves per-invocation private storage. */
    cso->scratch_private = true;
-   nir_foreach_function_impl(impl, nir) {
-      nir_foreach_block(block, impl) {
-         nir_foreach_instr(instr, block) {
-            if (instr->type == nir_instr_type_intrinsic &&
-                nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_scratch_base_ptr)
-               cso->scratch_private = false;
-         }
-      }
-   }
    vp_dbg("vortexpipe: compile %p: %s", (void *)cso,
           nir->info.name ? nir->info.name : "compute");
    vp_scan_descriptors(nir, cso->descs, &cso->num_descs);
@@ -226,6 +219,26 @@ static void launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *
    vp_dbg("vortexpipe: completed dispatch %u", ctx->launches);
 }
 
+static void copy_region(struct pipe_context *pipe, struct pipe_resource *dst,
+                        unsigned level, unsigned x, unsigned y, unsigned z,
+                        struct pipe_resource *src, unsigned src_level,
+                        const struct pipe_box *box)
+{
+   struct vp_context *ctx = vp_reg_get(pipe);
+   ctx->lp_resource_copy_region(pipe, dst, level, x, y, z, src, src_level, box);
+   if (ctx->dev && vx_dcr_write(ctx->dev, VX_DCR_BASE_CACHE_FLUSH, 1) != 0)
+      abort();
+}
+
+static void clear_buffer(struct pipe_context *pipe, struct pipe_resource *res,
+                         unsigned offset, unsigned size, const void *value, int value_size)
+{
+   struct vp_context *ctx = vp_reg_get(pipe);
+   ctx->lp_clear_buffer(pipe, res, offset, size, value, value_size);
+   if (ctx->dev && vx_dcr_write(ctx->dev, VX_DCR_BASE_CACHE_FLUSH, 1) != 0)
+      abort();
+}
+
 static void destroy_context(struct pipe_context *pipe)
 {
    struct vp_context *ctx = vp_reg_get(pipe);
@@ -251,6 +264,10 @@ struct pipe_context *vp_context_create(struct pipe_screen *screen, void *priv, u
       return NULL;
    }
    ctx->dev = vps->dev;
+   ctx->lp_resource_copy_region = pipe->resource_copy_region;
+   ctx->lp_clear_buffer = pipe->clear_buffer;
+   pipe->resource_copy_region = copy_region;
+   pipe->clear_buffer = clear_buffer;
    ctx->lp_set_constant_buffer = pipe->set_constant_buffer;
    ctx->lp_set_shader_buffers = pipe->set_shader_buffers;
    ctx->lp_context_destroy = pipe->destroy;

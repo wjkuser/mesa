@@ -17,6 +17,16 @@ extern "C" {
 #endif
 
 struct nir_shader;
+struct nir_builder;
+struct nir_def;
+
+/* Decode the tagged RT triangle reference on the shader execution path. */
+struct nir_def *vp_nir_decode_primitive(struct nir_builder *b,
+                                       struct nir_def *reference,
+                                       struct nir_def *is_procedural);
+struct nir_def *vp_nir_decode_geometry(struct nir_builder *b,
+                                      struct nir_def *reference,
+                                      struct nir_def *is_procedural);
 
 /* Vertex-shader output layout. vortexpipe's VS kernel
  * writes one record per vertex into a device buffer; the draw

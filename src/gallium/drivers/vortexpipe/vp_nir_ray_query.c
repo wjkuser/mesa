@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: MIT */
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "vp_nir_to_llvm.h"
@@ -69,10 +70,10 @@ static const unsigned hit_slots[] = {
 
 /* Decode the tagged triangle reference in SM code. Large IDs use an ID-word
  * pointer in the project's BVH layout; procedural IDs already came from SM. */
-static nir_def *
-decode_primitive(nir_builder *b, nir_def *reference, nir_def *flags)
+nir_def *
+vp_nir_decode_primitive(nir_builder *b, nir_def *reference, nir_def *is_procedural)
 {
-   nir_push_if(b, nir_ine_imm(b, nir_iand_imm(b, flags, VX_RT_HIT_PROCEDURAL), 0));
+   nir_push_if(b, is_procedural);
    nir_def *procedural = reference;
    nir_push_else(b, NULL);
    nir_def *tag = nir_ushr_imm(b, reference, VX_RT_PRIMITIVE_TAG_SHIFT);
@@ -89,24 +90,58 @@ decode_primitive(nir_builder *b, nir_def *reference, nir_def *flags)
    return nir_if_phi(b, procedural, triangle);
 }
 
+nir_def *
+vp_nir_decode_geometry(nir_builder *b, nir_def *reference, nir_def *is_procedural)
+{
+   nir_push_if(b, is_procedural);
+   nir_def *procedural = reference;
+   nir_push_else(b, NULL);
+   nir_def *tag = nir_ushr_imm(b, reference, VX_RT_PRIMITIVE_TAG_SHIFT);
+   nir_push_if(b, nir_ult_imm(b, tag, 5));
+   nir_def *width = nir_isub(b, nir_imm_int(b, 28), nir_ishl_imm(b, tag, 2));
+   nir_def *compact = nir_ushr(b, nir_iand_imm(b, reference, 0x0fffffff), width);
+   nir_push_else(b, NULL);
+   nir_def *address = nir_ishl_imm(b, nir_iand_imm(b, reference, 0x3fffffff), 2);
+   nir_def *indirect = nir_load_global_constant(b, nir_u2u64(b, address), 4, 1, 32);
+   nir_pop_if(b, NULL);
+   nir_def *triangle = nir_if_phi(b, compact, indirect);
+   nir_pop_if(b, NULL);
+   return nir_if_phi(b, procedural, triangle);
+}
+
 static void
 snapshot(nir_builder *b, nir_deref_instr *state, unsigned bank,
          nir_def *token, bool committed_registers)
 {
+   /* A snapshot observes one immutable returned record. Reuse its flags;
+    * candidate event classification already identifies procedural records. */
+   nir_def *flags = committed_registers
+      ? nir_vortex_rt_get_committed(b, 32, token, .base = VX_RT_HIT_FLAGS)
+      : nir_vortex_rt_get(b, 32, token, .base = VX_RT_HIT_FLAGS);
+   /* A missing committed hit has no attributes to decode. Preserve the
+    * previous distance bound (initially rayTMax) for generateIntersection,
+    * and refresh the validity flag even when the returned record is empty. */
+   if (committed_registers) {
+      store(b, state, bank + VX_RT_HIT_FLAGS, flags);
+      nir_push_if(b, nir_ine_imm(b, nir_iand_imm(b, flags, VX_RT_HIT_VALID), 0));
+   }
+   nir_def *is_procedural = bank == Q_CANDIDATE
+      ? nir_ieq_imm(b, token, VX_RT_EVENT_AABB)
+      : nir_ine_imm(b, nir_iand_imm(b, flags, VX_RT_HIT_PROCEDURAL), 0);
    for (unsigned i = 0; i < ARRAY_SIZE(hit_slots); ++i) {
       unsigned slot = hit_slots[i];
-      nir_def *value = committed_registers
+      if (committed_registers && slot == VX_RT_HIT_FLAGS) continue;
+      nir_def *value = slot == VX_RT_HIT_FLAGS ? flags : committed_registers
          ? nir_vortex_rt_get_committed(b, 32, token, .base = slot)
          : nir_vortex_rt_get(b, 32, token, .base = slot);
       if (slot == VX_RT_HIT_T) value = nir_iand_imm(b, value, 0x7fffffff);
-      if (slot == VX_RT_HIT_PRIMITIVE_ID) {
-         nir_def *flags = committed_registers
-            ? nir_vortex_rt_get_committed(b, 32, token, .base = VX_RT_HIT_FLAGS)
-            : nir_vortex_rt_get(b, 32, token, .base = VX_RT_HIT_FLAGS);
-         value = decode_primitive(b, value, flags);
-      }
+      if (slot == VX_RT_HIT_PRIMITIVE_ID)
+         value = vp_nir_decode_primitive(b, value, is_procedural);
+      if (slot == VX_RT_HIT_GEOMETRY_INDEX)
+         value = vp_nir_decode_geometry(b, value, is_procedural);
       store(b, state, bank + slot, value);
    }
+   if (committed_registers) nir_pop_if(b, NULL);
 }
 
 static void
@@ -170,20 +205,6 @@ load_primitive(nir_builder *b, nir_deref_instr *state)
    store(b, state, Q_RANGE_CURSOR, nir_iadd_imm(b, load(b, state, Q_RANGE_CURSOR), 1));
 }
 
-/* A generated (procedural) hit returns its distance and accepted primitive; the
- * RTU reads them only for GENERATE actions, so other candidates skip the SETs. */
-static void
-set_generated_hit(nir_builder *b, nir_deref_instr *state)
-{
-   nir_def *action = load(b, state, Q_ACTION);
-   nir_push_if(b, nir_ior(b, nir_ieq_imm(b, action, VX_RT_ACTION_GENERATE),
-                          nir_ieq_imm(b, action, VX_RT_ACTION_GENERATE_TERMINATE)));
-   nir_vortex_rt_set(b, load(b, state, Q_COMMITTED + VX_RT_HIT_PRIMITIVE_ID),
-                     .base = VX_RT_HIT_PRIMITIVE_ID);
-   nir_vortex_rt_set(b, load(b, state, Q_GENERATED_T), .base = VX_RT_HIT_T);
-   nir_pop_if(b, NULL);
-}
-
 static nir_def *instance_record(nir_builder *b, nir_deref_instr *state, unsigned bank);
 
 /* Whether the RT unit evaluates opacity micromaps (Ada and later). Without it,
@@ -196,7 +217,11 @@ static bool
 omm_engine(void)
 {
    const char *value = getenv("HACKRTCORE_RTU_OMM_ENGINE");
-   return !value || strcmp(value, "0") != 0;
+   if (!value || (strcmp(value, "0") && strcmp(value, "1"))) {
+      fprintf(stderr, "vortexpipe: HACKRTCORE_RTU_OMM_ENGINE requires a public target profile\n");
+      abort();
+   }
+   return strcmp(value, "0") != 0;
 }
 
 static void
@@ -238,9 +263,9 @@ proceed(nir_builder *b, nir_deref_instr *state, nir_def *continuation)
    nir_push_if(b, range_pending(b, state));
    load_primitive(b, state);
    nir_push_else(b, NULL);
-   /* Each event returns one procedural leaf: every further leaf is a full
-    * proceed round trip, as in native RayQuery. Only a generated hit returns
-    * its accepted primitive. */
+   /* Native RayQuery and TraceRay both return traversal state to SM at a
+    * candidate. Resume submits the ray and that state as a new RT request.
+    * Only a generated hit returns its accepted primitive. */
    nir_push_if(b, generated);
    nir_vortex_rt_set(b, load(b, state, Q_COMMITTED + VX_RT_HIT_PRIMITIVE_ID),
                      .base = VX_RT_HIT_PRIMITIVE_ID);
@@ -294,67 +319,6 @@ proceed(nir_builder *b, nir_deref_instr *state, nir_def *continuation)
    nir_pop_if(b, NULL);
    nir_pop_if(b, NULL);
    return nir_ieq_imm(b, load(b, state, Q_PHASE), Q_HAS_CANDIDATE);
-}
-
-static nir_def *
-proceed_resident(nir_builder *b, nir_deref_instr *state)
-{
-   nir_push_if(b, nir_ine_imm(b, load(b, state, Q_PHASE), Q_COMPLETE));
-   nir_def *first_hit = nir_iand(b,
-      nir_ieq_imm(b, load(b, state, Q_ACTION), VX_RT_ACTION_GENERATE),
-      nir_ine_imm(b, nir_iand_imm(b, load(b, state, Q_FLAGS), VX_RT_FLAG_TERMINATE_ON_FIRST_HIT), 0));
-   nir_push_if(b, nir_iand(b, nir_inot(b, first_hit), range_pending(b, state)));
-   load_primitive(b, state);
-   nir_push_else(b, NULL);
-   nir_push_if(b, nir_ieq_imm(b, load(b, state, Q_PHASE), Q_INITIALIZED));
-   nir_vortex_rt_set(b, nir_imm_int(b, 0), .base = VX_RT_QUERY_CONTEXT);
-   nir_def *flags = nir_ior(b, nir_ior(b, load(b, state, Q_FLAGS), load(b, state, Q_RETURN_FLAGS)),
-       nir_ishl_imm(b, nir_iand_imm(b, load(b, state, Q_MASK), 255), 16));
-   store(b, state, Q_HANDLE, nir_vortex_rt_wtrace(b, 32,
-       load(b, state, Q_SCENE), flags, load_vector(b, state, Q_ORIGIN, 3),
-       load_vector(b, state, Q_DIRECTION, 3), load(b, state, Q_MIN), load(b, state, Q_MAX)));
-   nir_push_else(b, NULL);
-   set_generated_hit(b, state);
-   nir_vortex_rt_action(b, 32, load(b, state, Q_HANDLE), load(b, state, Q_ACTION));
-   nir_pop_if(b, NULL);
-   nir_def *token = nir_vortex_rt_event_wait(b, 32, load(b, state, Q_HANDLE));
-   nir_push_if(b, nir_ieq_imm(b, token, VX_RT_EVENT_COMPLETE));
-   nir_def *terminal = nir_vortex_rt_wait(b, 32, load(b, state, Q_HANDLE));
-   snapshot_terminal(b, state, terminal);
-   store(b, state, Q_PHASE, nir_imm_int(b, Q_COMPLETE));
-   nir_push_else(b, NULL);
-   snapshot(b, state, Q_CANDIDATE, token, false);
-   snapshot(b, state, Q_COMMITTED, token, true);
-   nir_push_if(b, nir_ieq_imm(b, token, VX_RT_EVENT_TRIANGLE));
-   check_micromap(b, state, Q_CANDIDATE);
-   nir_pop_if(b, NULL);
-   nir_push_if(b, nir_ieq_imm(b, token, VX_RT_EVENT_AABB));
-   load_range(b, state);
-   load_primitive(b, state);
-   nir_pop_if(b, NULL);
-   store(b, state, Q_PHASE, nir_imm_int(b, Q_HAS_CANDIDATE));
-   store(b, state, Q_ACTION, nir_imm_int(b, VX_RT_ACTION_IGNORE));
-   nir_pop_if(b, NULL);
-   nir_pop_if(b, NULL);
-   nir_pop_if(b, NULL);
-   return nir_ieq_imm(b, load(b, state, Q_PHASE), Q_HAS_CANDIDATE);
-}
-
-static void
-terminate_resident(nir_builder *b, nir_deref_instr *state)
-{
-   nir_push_if(b, nir_ieq_imm(b, load(b, state, Q_PHASE), Q_HAS_CANDIDATE));
-   nir_def *action = load(b, state, Q_ACTION);
-   action = nir_bcsel(b, nir_ieq_imm(b, action, VX_RT_ACTION_GENERATE),
-      nir_imm_int(b, VX_RT_ACTION_GENERATE_TERMINATE),
-      nir_bcsel(b, nir_ieq_imm(b, action, VX_RT_ACTION_ACCEPT),
-         nir_imm_int(b, VX_RT_ACTION_ACCEPT_TERMINATE), nir_imm_int(b, VX_RT_ACTION_TERMINATE)));
-   set_generated_hit(b, state);
-   nir_vortex_rt_action(b, 32, load(b, state, Q_HANDLE), action);
-   nir_def *terminal = nir_vortex_rt_wait(b, 32, load(b, state, Q_HANDLE));
-   snapshot_terminal(b, state, terminal);
-   nir_pop_if(b, NULL);
-   store(b, state, Q_PHASE, nir_imm_int(b, Q_COMPLETE));
 }
 
 static void
@@ -515,14 +479,11 @@ vp_nir_lower_ray_tracing_to_rtu(nir_shader *shader)
             initialize(&b, in, state, (uintptr_t)_mesa_hash_table_search(returns, var)->data);
             break;
          case nir_intrinsic_rq_proceed:
-            if (var->data.rtu_resident_query)
-               result = proceed_resident(&b, state);
-            else result = proceed(&b, state, continuation_address(&b, query,
+            result = proceed(&b, state, continuation_address(&b, query,
                (uintptr_t)_mesa_hash_table_search(continuations, var)->data));
             break;
          case nir_intrinsic_rq_terminate:
-            if (var->data.rtu_resident_query) terminate_resident(&b, state);
-            else terminate(&b, state);
+            terminate(&b, state);
             break;
          case nir_intrinsic_rq_confirm_intersection:
             commit_candidate(&b, state);

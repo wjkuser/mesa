@@ -169,24 +169,51 @@ vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
    }
 
    /* Preserve branch-local stores so Vortex split/join regions stay nested. */
-   const char *simt_options = "-mllvm -vortex-divergence-max-bbs=65536 "
+   char simt_options[2048] = "-mllvm -vortex-divergence-max-bbs=65536 "
                               "-mllvm -simplifycfg-sink-common=false "
                               "-funroll-loops -mllvm -unroll-runtime "
                               "-mllvm -enable-post-misched "
                               "-mllvm -riscv-use-rematerializable-movimm";
+   /* Public device resources, never simulator latency or fitted timing. */
+   static const char *resource_options[][2] = {
+      {"VX_CFG_REGISTER_WORDS_PER_SM", "vortex-register-words-per-sm"},
+      {"VX_CFG_REGISTER_ALLOCATION_WORDS", "vortex-register-allocation-words"},
+      {"VX_CFG_MAX_REGISTERS_PER_THREAD", "vortex-max-registers-per-thread"},
+      {"VX_CFG_NUM_THREADS", "vortex-warp-size"},
+      {"VX_CFG_ISSUE_WIDTH", "vortex-register-partitions"},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(resource_options); ++i) {
+      const char *value = getenv(resource_options[i][0]);
+      if (!value || !*value) {
+         mesa_loge("vortexpipe: missing public target property %s", resource_options[i][0]);
+         return false;
+      }
+      char *end;
+      unsigned long number = strtoul(value, &end, 10);
+      if (*end || !number || number > UINT32_MAX) {
+         mesa_loge("vortexpipe: invalid public target property %s", resource_options[i][0]);
+         return false;
+      }
+      size_t used = strlen(simt_options);
+      int added = snprintf(simt_options + used, sizeof(simt_options) - used,
+                           " -mllvm -%s=%lu", resource_options[i][1], number);
+      if (added < 0 || (size_t)added >= sizeof(simt_options) - used)
+         return false;
+   }
    char cache_path[640];
    bool cache_enabled = !getenv("VORTEXPIPE_NO_CACHE");
    cache_path[0] = '\0';
    if (cache_enabled) {
-      char cfg[1024];
+      char cfg[4096];
       snprintf(cfg, sizeof cfg, "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%llx|%d|%s",
                simt_options, td, vh, bd, target, gnu_dir, march, mabi,
                linker, libc, libcrt, startup_addr, link_gfx_sw ? 1 : 0, code_model);
       uint64_t key = vp_hash(0xcbf29ce484222325ull, cfg, strlen(cfg));
       key = vp_hash(key, llvm_ir, strlen(llvm_ir));
-      char inputs[2][1024];
+      char inputs[3][1024];
       snprintf(inputs[0], sizeof inputs[0], "%s/sw/kernel/scripts/vxbin.py", vh);
       snprintf(inputs[1], sizeof inputs[1], "%s/llvm-vortex/lib/libLLVMRISCVCodeGen.so", td);
+      snprintf(inputs[2], sizeof inputs[2], "%s/llvm-vortex/lib/libLLVMRISCVDesc.so", td);
       for (unsigned i = 0; i < ARRAY_SIZE(inputs); ++i) {
          size_t size;
          void *data = read_blob(inputs[i], &size);

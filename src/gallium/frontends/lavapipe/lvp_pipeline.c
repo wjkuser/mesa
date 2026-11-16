@@ -221,16 +221,18 @@ static void
 optimize(nir_shader *nir)
 {
 #ifdef VP_HACKRTCORE
-   /* Cloning a suspension site gives its continuations different PCs and
-    * prevents lanes from regrouping at the same native shader resume point. */
-   if (nir->info.stage == MESA_SHADER_RAYGEN) {
+   /* Preserve RT operation loops before lowering expands their state and
+    * control flow. Trace/callable copies also split the shared resume PC;
+    * ray queries otherwise duplicate their query and preparation code. */
+   {
       nir_foreach_function_impl(impl, nir) {
          nir_foreach_block(block, impl) {
             nir_foreach_instr(instr, block) {
                if (instr->type != nir_instr_type_intrinsic)
                   continue;
                nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
-               if (op != nir_intrinsic_trace_ray && op != nir_intrinsic_execute_callable)
+               if (op != nir_intrinsic_trace_ray && op != nir_intrinsic_execute_callable &&
+                   op != nir_intrinsic_rq_initialize && op != nir_intrinsic_rq_proceed)
                   continue;
                for (nir_cf_node *cf = block->cf_node.parent; cf; cf = cf->parent)
                   if (cf->type == nir_cf_node_loop)
