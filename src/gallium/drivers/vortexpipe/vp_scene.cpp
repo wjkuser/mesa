@@ -82,9 +82,15 @@ public:
          const auto &box = reinterpret_cast<const lvp_bvh_header *>(instance.bvh_ptr)->bounds;
          const float *low = reinterpret_cast<const float *>(&box.min);
          const float *high = reinterpret_cast<const float *>(&box.max);
+         // Vulkan defines an instance of an empty BLAS as a degenerate
+         // instance bounded by its origin. Transforming the empty (+inf,-inf)
+         // bounds instead produces NaNs, which are not valid SAH inputs.
+         const bool empty = low[0] > high[0] || low[1] > high[1] || low[2] > high[2];
          for (unsigned a = 0; a < 3; ++a) {
             const float *row = instance.otw_matrix.values[a];
             primitive.mn[a] = primitive.mx[a] = row[3];
+            if (empty)
+               continue;
             for (unsigned b = 0; b < 3; ++b) {
                primitive.mn[a] += std::min(row[b] * low[b], row[b] * high[b]);
                primitive.mx[a] += std::max(row[b] * low[b], row[b] * high[b]);

@@ -29,6 +29,9 @@ struct vp_context {
                                    struct pipe_resource *, unsigned, const struct pipe_box *);
    void (*lp_clear_buffer)(struct pipe_context *, struct pipe_resource *,
                            unsigned, unsigned, const void *, int);
+   uint64_t (*lp_create_texture_handle)(struct pipe_context *, struct pipe_sampler_view *,
+                                       const struct pipe_sampler_state *);
+   struct hash_table *texture_functions;
    unsigned launches;
 };
 

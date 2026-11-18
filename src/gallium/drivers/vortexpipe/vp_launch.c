@@ -19,6 +19,8 @@
 #include "vortex.h"
 #include "launch_constants.h"
 #include "vp_memory.h"
+#include "vp_texture.h"
+#include "llvmpipe/lp_texture_handle.h"
 #include "vp_private.h"        /* vp_screen_resident_addr */
 #ifdef VP_HACKRTCORE
 #include "vp_scene.h"
@@ -855,6 +857,48 @@ vp_launch(struct pipe_screen *screen, vx_device_h dev,
     *  - VP_DESC_IMAGE: copy the storage image into device memory,
     *    rewrite lp_jit_image.base, read back after the launch. */
    for (uint32_t i = 0; i < num_descs; i++) {
+      if (descs[i].cbuf_index >= VP_MAX_CBUFS)
+         goto done;
+      if (descs[i].kind == VP_DESC_TEXTURE_SET) {
+         unsigned set = descs[i].cbuf_index;
+         for (uint32_t offset = 0; offset + sizeof(struct lp_descriptor) <= cbufs[set].size;
+              offset += VP_DESC_STRIDE) {
+            struct lp_descriptor src;
+            memcpy(&src, (const char *)cbufs[set].host + offset, sizeof(src));
+            if (!src.functions || vp_reg_get(src.functions) != src.functions)
+               continue;
+            struct lp_texture_functions *functions = src.functions;
+            if (!functions->sampled)
+               continue;
+            struct lp_sampler_matrix *matrix = functions->matrix;
+            if (!matrix || src.texture.sampler_index >= matrix->sampler_count)
+               goto done;
+            struct vp_sampled_descriptor descriptor;
+            uint32_t bytes;
+            if (!vp_sampled_descriptor_init(&descriptor, &src, &functions->state,
+                                           &matrix->samplers[src.texture.sampler_index]) ||
+                !vp_sampled_texture_bytes(&src, &bytes)) {
+               mesa_loge("vortexpipe: unsupported sampled-image descriptor");
+               goto done;
+            }
+            if (!src.texture.base)
+               goto done;
+            vx_buffer_h buffer;
+            uint32_t buffer_offset;
+            bool dirty;
+            descriptor.texture.base = vp_screen_resident_addr(screen, src.texture.base, bytes,
+                                             &buffer, &buffer_offset, &dirty);
+            if (!descriptor.texture.base)
+               goto done;
+            if (dirty) {
+               VP_CHECK(vx_enqueue_write(q, buffer, buffer_offset, src.texture.base,
+                                         bytes, 0, NULL, NULL), "upload sampled image");
+               vp_screen_resident_clean(screen, src.texture.base, bytes);
+            }
+            memcpy(stage + offsets[set] + offset, &descriptor, sizeof(descriptor));
+         }
+         continue;
+      }
       uint8_t *slot = stage + offsets[descs[i].cbuf_index] + descs[i].offset;
 
       if (descs[i].kind == VP_DESC_AS) {

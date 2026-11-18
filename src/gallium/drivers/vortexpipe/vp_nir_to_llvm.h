@@ -148,7 +148,7 @@ void vp_free_ir(char *ir);
  *    address at `offset`.
  *  - VP_DESC_IMAGE: a storage image -- lp_jit_image at `offset`; base at +0
  *    (aliases lp_jit_buffer.ptr), size derived from height*row_stride. */
-enum vp_desc_kind { VP_DESC_BUFFER, VP_DESC_AS, VP_DESC_IMAGE };
+enum vp_desc_kind { VP_DESC_BUFFER, VP_DESC_AS, VP_DESC_IMAGE, VP_DESC_TEXTURE_SET };
 struct vp_desc {
    unsigned          offset;   /* byte offset in the descriptor buffer */
    /* The constant-buffer index holding this descriptor = descriptor set + 1

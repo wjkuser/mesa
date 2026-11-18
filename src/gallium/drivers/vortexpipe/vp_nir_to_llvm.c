@@ -21,6 +21,7 @@
  */
 
 #include "vp_nir_to_llvm.h"
+#include "vp_texture_abi.h"
 #include "vp_compile.h"      /* vp_xlen_is_64 */
 #include "vp_private.h"      /* vp_dbg */
 #ifndef VP_COMPUTE_ONLY
@@ -1912,6 +1913,8 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       /* Captured native clock2x32ARB waits on scoreboard SB0 before reading
        * SR_CLOCK. WSYNC conservatively drains older warp instructions here;
        * it does not model the native scoreboard's individual barrier slots. */
+      /* Reads in different active masks observe distinct dynamic events. */
+      unsigned conv = LLVMGetEnumAttributeKindForName("convergent", 10);
       if (LLVMGetIntTypeWidth(t->iptr) == 64) {
          LLVMTypeRef type = LLVMFunctionType(t->i64, NULL, 0, false);
          char code[] = ".insn r 11, 7, 0, x0, x0, x0\n\tcsrr $0, 0xb00",
@@ -1919,6 +1922,8 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          LLVMValueRef function = LLVMGetInlineAsm(type, code, strlen(code),
             constraints, strlen(constraints), true, false, LLVMInlineAsmDialectATT, false);
          LLVMValueRef cycles = LLVMBuildCall2(t->b, type, function, NULL, 0, "cycles");
+         LLVMAddCallSiteAttribute(cycles, LLVMAttributeFunctionIndex,
+            LLVMCreateEnumAttribute(t->ctx, conv, 0));
          ssa_set(t, in->def.index, 0, LLVMBuildTrunc(t->b, cycles, t->i32, "cycle_lo"));
          ssa_set(t, in->def.index, 1, LLVMBuildTrunc(t->b,
             LLVMBuildLShr(t->b, cycles, LLVMConstInt(t->i64, 32, false), ""), t->i32, "cycle_hi"));
@@ -1936,6 +1941,8 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
          LLVMValueRef function = LLVMGetInlineAsm(type, code, strlen(code),
             constraints, strlen(constraints), true, false, LLVMInlineAsmDialectATT, false);
          LLVMValueRef cycles = LLVMBuildCall2(t->b, type, function, NULL, 0, "cycles");
+         LLVMAddCallSiteAttribute(cycles, LLVMAttributeFunctionIndex,
+            LLVMCreateEnumAttribute(t->ctx, conv, 0));
          ssa_set(t, in->def.index, 0, LLVMBuildExtractValue(t->b, cycles, 1, "cycle_lo"));
          ssa_set(t, in->def.index, 1, LLVMBuildExtractValue(t->b, cycles, 0, "cycle_hi"));
       }
@@ -4719,6 +4726,61 @@ emit_phi(struct vp_tr *t, nir_phi_instr *phi)
       ssa_set(t, phi->def.index, c, LLVMBuildPhi(t->b, ty, "phi"));
 }
 
+static void
+emit_bindless_tex(struct vp_tr *t, nir_tex_instr *tex)
+{
+   if (tex->op != nir_texop_txl || tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
+       tex->is_array || tex->is_shadow || tex->def.bit_size != 32 ||
+       nir_alu_type_get_base_type(tex->dest_type) != nir_type_float) {
+      mesa_loge("vortexpipe: unsupported bindless texture operation %u", tex->op);
+      t->ok = false;
+      return;
+   }
+   LLVMValueRef texture = NULL, sampler = NULL, u = NULL, v = NULL, lod = NULL;
+   for (unsigned i = 0; i < tex->num_srcs; ++i) {
+      nir_tex_src *src = &tex->src[i];
+      LLVMValueRef value = ssa_get(t, src->src.ssa->index, 0);
+      switch (src->src_type) {
+      case nir_tex_src_texture_handle: texture = LLVMBuildIntCast2(t->b, value, t->iptr, false, "tex.address"); break;
+      case nir_tex_src_sampler_handle: sampler = LLVMBuildIntCast2(t->b, value, t->iptr, false, "sampler.address"); break;
+      case nir_tex_src_coord:
+         u = as_float(t, value, 32);
+         v = as_float(t, ssa_get(t, src->src.ssa->index, 1), 32);
+         break;
+      case nir_tex_src_lod: lod = as_float(t, value, 32); break;
+      default:
+         mesa_loge("vortexpipe: unsupported bindless texture source %u", src->src_type);
+         t->ok = false;
+         return;
+      }
+   }
+   if (!texture || !sampler || !u || !v || !lod) {
+      t->ok = false;
+      return;
+   }
+   sampler = LLVMBuildAdd(t->b, sampler,
+      LLVMConstInt(t->iptr, offsetof(struct vp_sampled_descriptor, sampler), false), "");
+   LLVMTypeRef types[] = {t->iptr, t->iptr, t->f32, t->f32, t->f32};
+   LLVMTypeRef ft = LLVMFunctionType(t->i32, types, 5, false);
+   const char *assembly = ".insn r 91, 0, 1, x0, $1, $2\n\t.insn r4 91, 1, 1, x0, $3, $4, $5\n\t.insn r 91, 2, 1, $0, x0, x0";
+   const char *constraints = "=r,r,r,f,f,f,~{memory}";
+   LLVMValueRef op = LLVMGetInlineAsm(ft, assembly, strlen(assembly),
+      constraints, strlen(constraints), true, false, LLVMInlineAsmDialectATT, false);
+   LLVMValueRef args[] = {texture, sampler, u, v, lod};
+   LLVMValueRef ready = LLVMBuildCall2(t->b, ft, op, args, 5, "tex.ready");
+   for (unsigned c = 0; c < tex->def.num_components; ++c) {
+      char get[80];
+      snprintf(get, sizeof(get), ".insn r 91, 3, 1, $0, $1, x%u", c);
+      LLVMTypeRef result_type = LLVMFunctionType(t->f32, &t->i32, 1, false);
+      const char *result_constraints = "=f,r,~{memory}";
+      LLVMValueRef read = LLVMGetInlineAsm(result_type, get, strlen(get),
+         result_constraints, strlen(result_constraints), true, false,
+         LLVMInlineAsmDialectATT, false);
+      LLVMValueRef value = LLVMBuildCall2(t->b, result_type, read, &ready, 1, "tex.result");
+      ssa_set(t, tex->def.index, c, LLVMBuildBitCast(t->b, value, t->i32, ""));
+   }
+}
+
 static bool
 emit_instr(struct vp_tr *t, nir_instr *instr)
 {
@@ -4739,7 +4801,7 @@ emit_instr(struct vp_tr *t, nir_instr *instr)
 #ifndef VP_COMPUTE_ONLY
       emit_tex(t, nir_instr_as_tex(instr));
 #else
-      t->ok = false;
+      emit_bindless_tex(t, nir_instr_as_tex(instr));
 #endif
       break;
    case nir_instr_type_phi:
@@ -6257,6 +6319,13 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
    /* Local storage is emitted as scalar/vector/array allocations. */
    NIR_PASS(_, nir, nir_split_struct_vars, nir_var_function_temp);
    NIR_PASS(_, nir, nir_remove_dead_derefs);
+   /* Indirectly addressed private arrays require per-invocation storage.
+    * Keep them in dispatch-owned scratch, not the fixed ABI call stack. */
+   if (nir->info.stage == MESA_SHADER_COMPUTE) {
+      NIR_PASS(_, nir, nir_lower_vars_to_scratch, nir_var_function_temp, 0,
+               glsl_get_word_size_align_bytes, glsl_get_word_size_align_bytes);
+      NIR_PASS(_, nir, nir_remove_dead_derefs);
+   }
 #ifdef VP_COMPUTE_ONLY
    if (nir->info.stage != MESA_SHADER_COMPUTE)
       return false;
@@ -6707,6 +6776,31 @@ vp_desc_addr_offset(nir_def *def, unsigned *cbuf_index)
 /* Record the distinct descriptors a shader touches, up to `cap`, and return how
  * many were found -- a count that stops rising at `cap`, so a caller wanting to
  * know whether the shader exceeds a smaller limit has to pass room above it. */
+static bool
+vp_texture_handle_set(nir_def *def, unsigned *set, unsigned depth)
+{
+   if (depth > 32)
+      return false;
+   nir_instr *instr = def->parent_instr;
+   if (instr->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+      if (in->intrinsic == nir_intrinsic_load_const_buf_base_addr_lvp &&
+          nir_src_is_const(in->src[0])) {
+         *set = nir_src_as_uint(in->src[0]);
+         return true;
+      }
+   }
+   if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      if (alu->op == nir_op_iadd || alu->op == nir_op_mov) {
+         for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
+            if (vp_texture_handle_set(alu->src[i].src.ssa, set, depth + 1))
+               return true;
+      }
+   }
+   return false;
+}
+
 static unsigned
 vp_scan_descs_into(struct nir_shader *nir, struct vp_desc *out, unsigned cap)
 {
@@ -6714,6 +6808,23 @@ vp_scan_descs_into(struct nir_shader *nir, struct vp_desc *out, unsigned cap)
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(blk, impl) {
          nir_foreach_instr(instr, blk) {
+            if (instr->type == nir_instr_type_tex) {
+               nir_tex_instr *tex = nir_instr_as_tex(instr);
+               for (unsigned j = 0; j < tex->num_srcs; j++) {
+                  if (tex->src[j].src_type != nir_tex_src_texture_handle)
+                     continue;
+                  unsigned set;
+                  if (!vp_texture_handle_set(tex->src[j].src.ssa, &set, 0))
+                     continue;
+                  bool found = false;
+                  for (unsigned k = 0; k < n; k++)
+                     found |= out[k].kind == VP_DESC_TEXTURE_SET && out[k].cbuf_index == set;
+                  if (!found && n < cap)
+                     out[n++] = (struct vp_desc){.offset=UINT32_MAX,
+                        .cbuf_index=set, .kind=VP_DESC_TEXTURE_SET};
+               }
+               continue;
+            }
             if (instr->type != nir_instr_type_intrinsic)
                continue;
             nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);

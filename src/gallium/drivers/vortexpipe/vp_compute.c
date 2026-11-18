@@ -13,6 +13,7 @@
 #include "util/u_memory.h"
 #include "nir.h"
 #include "nir_builder.h"
+#include "gallivm/lp_bld_jit_types.h"
 
 static simple_mtx_t registry_lock = SIMPLE_MTX_INITIALIZER;
 static struct hash_table *registry;
@@ -78,7 +79,6 @@ static void *create_compute_state(struct pipe_context *pipe,
       NIR_PASS(_, nir, nir_zero_initialize_shared_memory, nir->info.shared_size, 16);
    }
    cso->lmem_size = nir->info.shared_size;
-   cso->scratch_size = nir->scratch_size;
    /* Taking a scratch pointer preserves per-invocation private storage. */
    cso->scratch_private = true;
    vp_dbg("vortexpipe: compile %p: %s", (void *)cso,
@@ -86,6 +86,7 @@ static void *create_compute_state(struct pipe_context *pipe,
    vp_scan_descriptors(nir, cso->descs, &cso->num_descs);
    char *ir = NULL;
    bool ok = vp_nir_to_llvm(nir, &ir, NULL, NULL, 1, 0);
+   cso->scratch_size = nir->scratch_size;
    if (ok) {
       struct vp_screen *screen = vp_reg_get(pipe->screen);
       /* Fixed-linked images need distinct addresses to remain resident when
@@ -119,6 +120,8 @@ static void delete_compute_state(struct pipe_context *pipe, void *state)
 {
    struct vp_context *ctx = vp_reg_get(pipe);
    struct vp_cso *cso = state;
+   if (!cso)
+      return;
    if (ctx->cur_cso == cso)
       ctx->cur_cso = NULL;
    release_module(cso);
@@ -239,6 +242,20 @@ static void clear_buffer(struct pipe_context *pipe, struct pipe_resource *res,
       abort();
 }
 
+static uint64_t create_texture_handle(struct pipe_context *pipe,
+                                      struct pipe_sampler_view *view,
+                                      const struct pipe_sampler_state *sampler)
+{
+   struct vp_context *ctx = vp_reg_get(pipe);
+   uint64_t value = ctx->lp_create_texture_handle(pipe, view, sampler);
+   struct lp_texture_handle *handle = (void *)(uintptr_t)value;
+   if (handle && handle->functions) {
+      _mesa_hash_table_insert(ctx->texture_functions, handle->functions, handle->functions);
+      vp_reg_put(handle->functions, handle->functions);
+   }
+   return value;
+}
+
 static void destroy_context(struct pipe_context *pipe)
 {
    struct vp_context *ctx = vp_reg_get(pipe);
@@ -247,6 +264,9 @@ static void destroy_context(struct pipe_context *pipe)
    for (unsigned i = 0; i < PIPE_MAX_SHADER_BUFFERS; ++i)
       pipe_resource_reference(&ctx->sbuf[i].buffer, NULL);
    vp_dbg("vortexpipe: device dispatches=%u", ctx->launches);
+   hash_table_foreach(ctx->texture_functions, entry)
+      vp_reg_del(entry->key);
+   _mesa_hash_table_destroy(ctx->texture_functions, NULL);
    ctx->lp_context_destroy(pipe);
    vp_reg_del(pipe);
    free(ctx);
@@ -263,6 +283,14 @@ struct pipe_context *vp_context_create(struct pipe_screen *screen, void *priv, u
       pipe->destroy(pipe);
       return NULL;
    }
+   ctx->texture_functions = _mesa_pointer_hash_table_create(NULL);
+   if (!ctx->texture_functions) {
+      free(ctx);
+      pipe->destroy(pipe);
+      return NULL;
+   }
+   ctx->lp_create_texture_handle = pipe->create_texture_handle;
+   pipe->create_texture_handle = create_texture_handle;
    ctx->dev = vps->dev;
    ctx->lp_resource_copy_region = pipe->resource_copy_region;
    ctx->lp_clear_buffer = pipe->clear_buffer;
