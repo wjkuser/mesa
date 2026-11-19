@@ -810,6 +810,9 @@ struct pipe_compute_caps {
    uint64_t max_global_size;
    char ir_target[32];
    bool images_supported;
+   /* The compute backend accepts a different sampled texture/sampler handle
+    * in each invocation of a subgroup. */
+   bool non_uniform_texture_handles;
 };
 
 struct pipe_caps {

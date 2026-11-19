@@ -359,6 +359,16 @@ vp_finalize_nir(struct pipe_screen *screen, struct nir_shader *nir)
       lp_build_opt_nir(dev, vps->hw_num_threads);
    }
 
+   /* Keep divergent handles in the device copy. The software copy still
+    * needs subgroup-uniform handles before llvmpipe consumes it. */
+   if (screen->compute_caps.non_uniform_texture_handles &&
+       nir->info.stage == MESA_SHADER_COMPUTE) {
+      const nir_lower_non_uniform_access_options options = {
+         .types = nir_lower_non_uniform_texture_access,
+      };
+      NIR_PASS_V(nir, nir_lower_non_uniform_access, &options);
+   }
+
    char *err = vps->lp_finalize_nir(screen, nir);
 
    if (dev) {
@@ -677,6 +687,9 @@ vortexpipe_create_screen(struct sw_winsys *winsys)
        * subgroup_sizes is a BITMASK of supported sizes (bit b => size 1<<b). A warp
        * width is a power of two, so assigning it sets exactly the one bit that says
        * "the only subgroup size is NT". */
+#ifdef VP_COMPUTE_ONLY
+      caps->non_uniform_texture_handles = vps->has_tex && vps->dev_nir;
+#endif
       caps->subgroup_sizes = vps->hw_num_threads;
       caps->max_subgroups  = vps->hw_num_warps;
    }

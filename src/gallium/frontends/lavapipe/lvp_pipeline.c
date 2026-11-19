@@ -424,6 +424,10 @@ lvp_shader_lower(struct lvp_device *pdevice, nir_shader *nir, struct lvp_pipelin
    nir_lower_non_uniform_access_options options = {
       .types = nir_lower_non_uniform_ubo_access | nir_lower_non_uniform_texture_access | nir_lower_non_uniform_image_access,
    };
+   /* RT pipeline stages are dispatched as compute kernels in lavapipe. */
+   if (pdevice->pscreen->compute_caps.non_uniform_texture_handles &&
+       (nir->info.stage == MESA_SHADER_COMPUTE || gl_shader_stage_is_rt(nir->info.stage)))
+      options.types &= ~nir_lower_non_uniform_texture_access;
    NIR_PASS(_, nir, nir_lower_non_uniform_access, &options);
 
    lvp_lower_pipeline_layout(pdevice, layout, nir);

@@ -170,6 +170,7 @@ struct vp_tr {
    LLVMValueRef   lmem_base;    /* compute: shared-memory base (CTA LMEM) */
    /* Compute scratch uses dispatch-owned global memory; graphics uses allocas. */
    unsigned       scratch_size;
+   unsigned       trace_spill_offset;
    LLVMValueRef   scratch_base; /* iptr addr of the scratch alloca, or NULL */
    LLVMBasicBlockRef entry;     /* function entry block (alloca home) */
    LLVMValueRef   tex_f32_slot; /* float[4] the float texture ABI writes, or NULL */
@@ -3334,7 +3335,8 @@ emit_vx_rt_wtrace(struct vp_tr *t, LLVMValueRef scene, LLVMValueRef flags_cull,
                   LLVMValueRef ray[8], LLVMValueRef root, LLVMValueRef bytes)
 {
 #ifdef VP_HACKRTCORE
-   if (!root) {
+   bool direct = !root;
+   if (direct) {
       LLVMValueRef ptr = LLVMBuildIntToPtr(t->b, scene, t->ptr, "rt_scene");
       LLVMValueRef offset = LLVMConstInt(t->i32, 2, false);
       LLVMValueRef size_ptr = LLVMBuildGEP2(t->b, t->i32, ptr, &offset, 1, "");
@@ -3368,16 +3370,30 @@ emit_vx_rt_wtrace(struct vp_tr *t, LLVMValueRef scene, LLVMValueRef flags_cull,
                    ".insn r4 91, 2, 0, x0, $8, $9, $10\n\t"
                    ".insn r4 91, 4, 0, x0, $11, $12, $4";
    const char *c = "=&r,r,r,r,r,f,f,f,f,f,f,f,f,~{memory}";
-   LLVMTypeRef args[12] = {t->i32, t->i32, t->i32, t->i32};
-   LLVMValueRef a[12] = {scene, flags_cull, root, bytes};
+   LLVMTypeRef args[14] = {t->i32, t->i32, t->i32, t->i32};
+   LLVMValueRef a[14] = {scene, flags_cull, root, bytes};
    for (unsigned i = 0; i < 8; ++i) {
       args[i + 4] = t->f32;
       a[i + 4] = LLVMBuildBitCast(t->b, ray[i], t->f32, "");
    }
-   LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, 12, false);
+   unsigned nargs = 12;
+   if (direct) {
+      s = ".insn r4 91, 0, 0, $0, $1, $2, $3\n\t"
+          ".insn r4 91, 1, 0, x0, $5, $6, $7\n\t"
+          ".insn r4 91, 2, 0, x0, $8, $9, $10\n\t"
+          ".insn r4 91, 3, 0, x0, $13, $14, x0\n\t"
+          ".insn r4 91, 4, 0, x0, $11, $12, $4";
+      c = "=&r,r,r,r,r,f,f,f,f,f,f,f,f,r,r,~{memory}";
+      args[12] = args[13] = t->i32;
+      a[12] = LLVMBuildIntCast2(t->b, LLVMBuildAdd(t->b, emit_scratch_base(t),
+         LLVMConstInt(t->iptr, t->trace_spill_offset, false), "rt_spill"), t->i32, false, "");
+      a[13] = LLVMConstInt(t->i32, VX_RT_QUERY_SPILL_BYTES, false);
+      nargs = 14;
+   }
+   LLVMTypeRef fnty = LLVMFunctionType(t->i32, args, nargs, false);
    LLVMValueRef ia = LLVMGetInlineAsm(fnty, s, strlen(s), c, strlen(c),
                                       true, false, LLVMInlineAsmDialectATT, false);
-   return LLVMBuildCall2(t->b, fnty, ia, a, 12, "rttrace");
+   return LLVMBuildCall2(t->b, fnty, ia, a, nargs, "rttrace");
 #else
    LLVMValueRef z = LLVMConstInt(t->i32, 0, false);
    LLVMValueRef cfg = emit_vx_wgather(t, z, scene, z, flags_cull);
@@ -6447,6 +6463,23 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
    LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(t.ctx, fn, "entry");
    LLVMPositionBuilderAtEnd(t.b, entry);
    t.entry = entry;
+#ifdef VP_HACKRTCORE
+   /* Direct traces wait for traversal before a shader can issue another.
+    * One private spill range suffices for every direct trace in this kernel. */
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_vortex_rt_wtrace) {
+               t.trace_spill_offset = ALIGN(nir->scratch_size, 64);
+               nir->scratch_size = t.trace_spill_offset + VX_RT_QUERY_SPILL_BYTES;
+               goto allocated_trace_spill;
+            }
+         }
+      }
+   }
+allocated_trace_spill:
+#endif
    t.scratch_size = nir->scratch_size;
 
    /* Where a discarded fragment's stores go to die. Sized for the widest store the

@@ -1617,6 +1617,9 @@ lvp_trace_ray_rtu(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *comp
    nir_def *status = nir_vortex_rt_wait(b, 32, handle);
    nir_def *is_hit = nir_ieq_imm(b, status, VX_RT_STS_DONE_HIT);
 
+   nir_store_var(b, state->traversal.hit, is_hit, 1);
+   nir_push_if(b, nir_iand(b, is_hit, nir_inot(b, nir_test_mask(
+      b, flags, SpvRayFlagsSkipClosestHitShaderKHRMask))));
    nir_def *t     = nir_vortex_rt_get(b, 32, status, .base = VX_RT_HIT_T);
    nir_def *bary_u = nir_vortex_rt_get(b, 32, status, .base = VX_RT_HIT_BARY_U);
    nir_def *bary_v = nir_vortex_rt_get(b, 32, status, .base = VX_RT_HIT_BARY_V);
@@ -1625,16 +1628,14 @@ lvp_trace_ray_rtu(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *comp
    geom = vp_nir_decode_geometry(b, geom, nir_imm_false(b));
    nir_def *cust  = nir_vortex_rt_get(b, 32, status, .base = VX_RT_HIT_INSTANCE_CUSTOM);
 
-   /* tmax holds the committed hit distance on a hit; keep the ray's tmax on a
-    * miss (the miss shader reads gl_RayTmaxEXT). */
-   nir_store_var(b, state->tmax, nir_bcsel(b, is_hit, t, tmax), 0x1);
+   /* The caller initialized tmax for miss. Closest-hit consumes the committed distance. */
+   nir_store_var(b, state->tmax, t, 0x1);
    nir_store_var(b, state->primitive_id,
       vp_nir_decode_primitive(b, prim, nir_imm_false(b)), 0x1);
    nir_store_var(b, state->geometry_id_and_flags, geom, 0x1);
    nir_store_var(b, state->rtu_instance_custom_index, cust, 0x1);
    nir_store_var(b, state->hit_kind,
       nir_vortex_rt_get(b, 32, status, .base = VX_RT_HIT_ATTR_0), 0x1);
-   nir_store_var(b, state->traversal.hit, is_hit, 0x1);
 
    /* Barycentrics live in scratch at the traversal stack pointer — the exact
     * slot the software triangle handler uses, so the closest-hit's
@@ -1644,7 +1645,6 @@ lvp_trace_ray_rtu(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *comp
 
    /* A hit selects its record relative to the instance's SBT base. The
     * instance metadata is also the source of shader instance/transform data. */
-   nir_push_if(b, is_hit);
    nir_def *instance = nir_vortex_rt_get(b, 32, status, .base = VX_RT_HIT_INSTANCE_ID);
    nir_def *table = nir_load_global_constant(b,
       nir_u2u64(b, nir_iadd_imm(b, scene, RTU_SCENE_INSTANCE_TABLE_OFFSET)), 4, 1, 32);
@@ -1754,7 +1754,10 @@ lvp_trace_ray_query(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *co
    nir_def *committed_type = lvp_rtu_query_value(b, query, nir_ray_query_value_intersection_type, true);
    nir_def *hit = nir_ine_imm(b, committed_type, 0);
    nir_store_var(b, state->traversal.hit, hit, 1);
-   nir_push_if(b, hit);
+   /* The committed attributes, instance record and SBT index are inputs to
+    * the closest-hit invocation. A skipped hit returns its current payload. */
+   nir_push_if(b, nir_iand(b, hit, nir_inot(b, nir_test_mask(
+      b, flags, SpvRayFlagsSkipClosestHitShaderKHRMask))));
    lvp_rtu_instance(b, state, query, scene, true);
    nir_store_var(b, state->instance_addr, nir_load_var(b, state->traversal.instance_addr), 1);
    nir_store_var(b, state->primitive_id,
