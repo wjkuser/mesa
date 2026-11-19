@@ -15,6 +15,19 @@
 extern "C" {
 #endif
 
+/* Immutable for the lifetime of one screen. Register budget fields are
+ * absent on targets without a documented partition layout. */
+struct vp_compiler_target {
+   unsigned xlen;
+   bool native_redux;
+#define VP_RESOURCE(field, key, option) unsigned field;
+#include "vp_register_resources.def"
+#undef VP_RESOURCE
+};
+
+bool vp_init_compiler_target(struct vp_compiler_target *target,
+                             unsigned warp_size, unsigned xlen);
+
 /* Compile LLVM-IR text (a Vortex KMU kernel module, as produced by
  * vp_nir_to_llvm) into a Vortex .vxbin image linked at `startup_addr`.
  * On success returns true and stores a malloc'd blob + size in
@@ -32,16 +45,10 @@ extern "C" {
  * gfx_tex_sample_sw / gfx_om_fragment_sw calls resolve and inline (the divergent
  * OM merge needs the Vortex divergence pass over the whole kernel). Set when any
  * unit is routed to software; ignored otherwise (--gc-sections drops it). */
-bool vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
+bool vp_compile_vxbin(const struct vp_compiler_target *gpu, const char *llvm_ir, unsigned long long startup_addr,
                       bool link_gfx_sw, void **out_blob, size_t *out_size);
 
 void vp_free_blob(void *blob);
-
-/* True when $MESA_VORTEX_XLEN selects rv64 (otherwise rv32). Single
- * source of truth for the target XLEN -- both vp_compile_vxbin and
- * the LLVM codegen in vp_nir_to_llvm consult this. Mesa-namespaced
- * env var so it doesn't collide with the linked Vortex runtime. */
-bool vp_xlen_is_64(void);
 
 #ifdef __cplusplus
 }

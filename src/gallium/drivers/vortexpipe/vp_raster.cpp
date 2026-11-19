@@ -109,6 +109,7 @@ vp_log2u(uint32_t n)
 #define VP_RASTER_POOL_BUFS 18
 
 struct vp_raster_pool {
+   unsigned xlen;
    vx_buffer_h bufs[VP_RASTER_POOL_BUFS];
    pipe_arg_t  addr;
    uint32_t    cap_tris;
@@ -130,9 +131,11 @@ struct vp_raster_pool {
 };
 
 extern "C" struct vp_raster_pool *
-vp_raster_pool_create(void)
+vp_raster_pool_create(unsigned xlen)
 {
-   return new (std::nothrow) vp_raster_pool{};
+   auto *pool = new (std::nothrow) vp_raster_pool{};
+   if (pool) pool->xlen = xlen;
+   return pool;
 }
 
 extern "C" void
@@ -162,7 +165,7 @@ vp_pool_module(vx_device_h dev, struct vp_raster_pool *pool)
    if (pool->fe_module != NULL)
       return true;
    size_t fe_size = 0;
-   const void *fe_bytes = vp_gfx_frontend_vxbin(vp_xlen_is_64(), &fe_size);
+   const void *fe_bytes = vp_gfx_frontend_vxbin(pool->xlen == 64, &fe_size);
    if (vx_module_load_bytes(dev, fe_bytes, fe_size, &pool->fe_module) != VX_SUCCESS) {
       mesa_loge("vortexpipe: raster: front-end module load failed");
       pool->fe_module = NULL;

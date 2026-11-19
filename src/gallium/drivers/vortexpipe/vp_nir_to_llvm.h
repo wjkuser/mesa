@@ -64,7 +64,8 @@ struct vp_sw_routing {
  * blue); all three are ignored for VS/compute. Two fragment shaders differing
  * only in these are different kernels, which is why they are translation inputs
  * rather than draw-time arguments. */
-bool vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
+struct vp_compiler_target;
+bool vp_nir_to_llvm(const struct vp_compiler_target *gpu, struct nir_shader *nir, char **out_ir,
                     struct vp_vs_layout *out_vs,
                     const struct vp_sw_routing *routing,
                     unsigned samples, uint8_t bgra_mask);

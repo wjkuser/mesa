@@ -63,7 +63,7 @@ struct vp_scissor_rect {
  * draws (grown on demand) instead of allocated per draw. Owned by the
  * context; opaque to the rest of vortexpipe. */
 struct vp_raster_pool;
-struct vp_raster_pool *vp_raster_pool_create(void);
+struct vp_raster_pool *vp_raster_pool_create(unsigned xlen);
 void                   vp_raster_pool_destroy(struct vp_raster_pool *pool);
 
 /* Output-merger state for a draw -- the Gallium depth-stencil + blend

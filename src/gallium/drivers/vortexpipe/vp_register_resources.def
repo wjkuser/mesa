@@ -1,0 +1,6 @@
+/* Target resource, public configuration key, LLVM target option. */
+VP_RESOURCE(warp_size, VX_CFG_NUM_THREADS, "vortex-warp-size")
+VP_RESOURCE(words, VX_CFG_REGISTER_WORDS_PER_SM, "vortex-register-words-per-sm")
+VP_RESOURCE(granule, VX_CFG_REGISTER_ALLOCATION_WORDS, "vortex-register-allocation-words")
+VP_RESOURCE(max_words, VX_CFG_MAX_REGISTERS_PER_THREAD, "vortex-max-registers-per-thread")
+VP_RESOURCE(partitions, VX_CFG_REGISTER_PARTITION_COUNT, "vortex-register-partitions")

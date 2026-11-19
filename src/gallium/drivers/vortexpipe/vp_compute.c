@@ -85,14 +85,14 @@ static void *create_compute_state(struct pipe_context *pipe,
           nir->info.name ? nir->info.name : "compute");
    vp_scan_descriptors(nir, cso->descs, &cso->num_descs);
    char *ir = NULL;
-   bool ok = vp_nir_to_llvm(nir, &ir, NULL, NULL, 1, 0);
+   struct vp_screen *screen = vp_reg_get(pipe->screen);
+   bool ok = vp_nir_to_llvm(&screen->target, nir, &ir, NULL, NULL, 1, 0);
    cso->scratch_size = nir->scratch_size;
    if (ok) {
-      struct vp_screen *screen = vp_reg_get(pipe->screen);
       /* Fixed-linked images need distinct addresses to remain resident when
        * dispatches alternate shaders, including across contexts. */
       simple_mtx_lock(&screen->resident_lock);
-      ok = vp_compile_vxbin(ir, screen->next_program_address, false,
+      ok = vp_compile_vxbin(&screen->target, ir, screen->next_program_address, false,
                             &cso->vxbin, &cso->vxbin_size);
       if (ok) {
          uint64_t image_end;
@@ -165,6 +165,10 @@ static void launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *
    struct vp_context *ctx = vp_reg_get(pipe);
    struct vp_screen *screen = vp_reg_get(pipe->screen);
    struct vp_cso *cso = ctx->cur_cso;
+   if (!cso) {
+      mesa_loge("vortexpipe: dispatch has no compiled compute shader");
+      abort();
+   }
    uint32_t grid[3];
    memcpy(grid, info->grid, sizeof(grid));
    if (info->indirect)

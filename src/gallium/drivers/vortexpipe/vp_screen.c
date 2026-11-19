@@ -351,12 +351,12 @@ vp_finalize_nir(struct pipe_screen *screen, struct nir_shader *nir)
     * using it. Taking the clone later instead would be too late for the
     * subgroup width, which is constant-folded in and cannot be re-lowered. */
    struct nir_shader *dev = NULL;
-   if (vps->dev_nir && vps->hw_num_threads &&
+   if (vps->dev_nir && vps->target.warp_size &&
        (nir->info.stage == MESA_SHADER_COMPUTE ||
         nir->info.stage == MESA_SHADER_VERTEX ||
         nir->info.stage == MESA_SHADER_FRAGMENT)) {
       dev = nir_shader_clone(NULL, nir);
-      lp_build_opt_nir(dev, vps->hw_num_threads);
+      lp_build_opt_nir(dev, vps->target.warp_size);
    }
 
    /* Keep divergent handles in the device copy. The software copy still
@@ -597,7 +597,15 @@ vortexpipe_create_screen(struct sw_winsys *winsys)
       if (vx_device_query(vps->dev, VX_CAPS_NUM_THREADS, &nt) == VX_SUCCESS &&
           vx_device_query(vps->dev, VX_CAPS_NUM_WARPS,   &nw) == VX_SUCCESS &&
           vx_device_query(vps->dev, VX_CAPS_ISA_FLAGS,   &isa) == VX_SUCCESS) {
-         vps->hw_num_threads    = (uint32_t)nt;
+         if (!vp_init_compiler_target(&vps->target, nt, VX_ISA_ARCH(isa))) {
+            vx_device_release(vps->dev);
+            _mesa_hash_table_destroy(vps->dev_nir, NULL);
+            simple_mtx_destroy(&vps->dev_nir_lock);
+            simple_mtx_destroy(&vps->resident_lock);
+            free(vps);
+            screen->destroy(screen);
+            return NULL;
+         }
          vps->hw_num_warps      = (uint32_t)nw;
          vps->hw_max_block_size = (uint32_t)(nt * nw);
          vps->hw_isa_flags      = isa;
@@ -611,7 +619,7 @@ vortexpipe_create_screen(struct sw_winsys *winsys)
 #endif
          vp_dbg("vortexpipe: caps: threads=%u, warps=%u, max_block=%u, "
                 "tex=%d, raster=%d, om=%d, rtu=%d",
-                vps->hw_num_threads, vps->hw_num_warps, vps->hw_max_block_size,
+                vps->target.warp_size, vps->hw_num_warps, vps->hw_max_block_size,
                 vps->has_tex, vps->has_raster, vps->has_om, vps->has_rtu);
       } else {
          mesa_logw("vortexpipe: failed to query device caps; treating as bare");
@@ -690,7 +698,7 @@ vortexpipe_create_screen(struct sw_winsys *winsys)
 #ifdef VP_COMPUTE_ONLY
       caps->non_uniform_texture_handles = vps->has_tex && vps->dev_nir;
 #endif
-      caps->subgroup_sizes = vps->hw_num_threads;
+      caps->subgroup_sizes = vps->target.warp_size;
       caps->max_subgroups  = vps->hw_num_warps;
    }
 

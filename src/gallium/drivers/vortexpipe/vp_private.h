@@ -26,6 +26,7 @@
 #include "pipe/p_state.h"      /* struct pipe_vertex_buffer (stored by value) */
 
 #include "vortex2.h"
+#include "vp_compile.h"
 #include "VX_types.h"            /* VX_TEX_LOD_MAX */
 #include "vp_nir_to_llvm.h"      /* struct vp_vs_layout */
 #ifndef VP_COMPUTE_ONLY
@@ -77,7 +78,7 @@ struct vp_screen {
     * upload path on the ISA extensions actually present. A device built
     * without them must take the llvmpipe fallback rather than emitting
     * vx_tex / vx_rast / vx_om instructions that will trap on decode. */
-   uint32_t hw_num_threads;
+   struct vp_compiler_target target;
    uint32_t hw_num_warps;
    uint32_t hw_max_block_size;
    uint64_t hw_isa_flags;
@@ -351,6 +352,7 @@ struct vp_velems_cso {
 
 /* Per-context vortexpipe state, keyed by the llvmpipe pipe_context *. */
 struct vp_context {
+   const struct vp_compiler_target *target; /* owned by the screen */
    vx_device_h dev;                       /* borrowed from vp_screen */
    /* llvmpipe entry points vortexpipe interposes on to invalidate the device's
     * copy of a resource the host just wrote. */

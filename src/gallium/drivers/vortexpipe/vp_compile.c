@@ -20,10 +20,7 @@
  * trees configured under a differently named build dir (e.g. the
  * CI build32/build64).
  *
- * The target XLEN is picked from the MESA_VORTEX_XLEN env var
- * (default "32"; "64" selects riscv64). Mesa-namespaced so it does
- * not collide with anything the linked Vortex runtime reads; mirrors
- * pocl_vortex/POCL_VORTEX_XLEN in shape (one ICD, env-var dispatch).
+ * Target resources and XLEN come from the screen that owns the shader.
  */
 
 #define _GNU_SOURCE
@@ -76,14 +73,53 @@ read_blob(const char *path, size_t *out_size)
    return buf;
 }
 
-/* Target XLEN from $MESA_VORTEX_XLEN (default "32"). "64" selects
- * riscv64, anything else selects riscv32. Mesa-namespaced so it
- * doesn't collide with the linked Vortex runtime. */
+/* Use the requested shader target when supplied. A standalone driver can
+ * discover it from the device; an explicit target must agree with that device. */
 bool
-vp_xlen_is_64(void)
+vp_init_compiler_target(struct vp_compiler_target *gpu, unsigned device_warp, unsigned device_xlen)
 {
-   const char *s = getenv("MESA_VORTEX_XLEN");
-   return s && strcmp(s, "64") == 0;
+   const char *width = getenv("VX_CFG_NUM_THREADS");
+   const char *bits = getenv("MESA_VORTEX_XLEN");
+   char *end;
+   unsigned long warp = width ? strtoul(width, &end, 10) : device_warp;
+   if ((width && (*width < '0' || *width > '9' || *end)) ||
+       warp != device_warp || !warp || warp > 32 || (warp & (warp - 1))) {
+      mesa_loge("vortexpipe: invalid or incompatible warp width (requested %s, device %u)",
+                width ? width : "auto", device_warp);
+      return false;
+   }
+   unsigned long xlen = bits ? strtoul(bits, &end, 10) : device_xlen;
+   if ((bits && (*bits < '0' || *bits > '9' || *end)) ||
+       xlen != device_xlen || (xlen != 32 && xlen != 64)) {
+      mesa_loge("vortexpipe: invalid or incompatible XLEN (requested %s, device %u)",
+                bits ? bits : "auto", device_xlen);
+      return false;
+   }
+   *gpu = (struct vp_compiler_target){ .warp_size = warp, .xlen = xlen };
+   const char *redux = getenv("HACKRTCORE_NATIVE_WARP_REDUX");
+   gpu->native_redux = redux && strcmp(redux, "1") == 0;
+   /* Without a known partition count, omit the entire extension budget.
+    * LLVM then uses its normal architectural registers and spills. */
+   if (!getenv("VX_CFG_REGISTER_PARTITION_COUNT"))
+      return true;
+   const struct { unsigned *dst; const char *key; } fields[] = {
+#define VP_RESOURCE(field, key, option) { &gpu->field, #key },
+#include "vp_register_resources.def"
+#undef VP_RESOURCE
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(fields); ++i) {
+      if (fields[i].dst == &gpu->warp_size)
+         continue;
+      const char *s = getenv(fields[i].key);
+      char *end;
+      unsigned long n = s ? strtoul(s, &end, 10) : 0;
+      if (!s || *s < '0' || *s > '9' || *end || !n || n > UINT32_MAX) {
+         mesa_loge("vortexpipe: invalid public target property %s", fields[i].key);
+         return false;
+      }
+      *fields[i].dst = n;
+   }
+   return true;
 }
 
 /* ---- shader disk cache ------------------------------------------------ *
@@ -132,7 +168,7 @@ vp_cache_dir(char *out, size_t out_size)
 }
 
 bool
-vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
+vp_compile_vxbin(const struct vp_compiler_target *gpu, const char *llvm_ir, unsigned long long startup_addr,
                  bool link_gfx_sw, void **out_blob, size_t *out_size)
 {
    *out_blob = NULL;
@@ -146,7 +182,7 @@ vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
       mesa_loge("vortexpipe: VORTEX_HOME / TOOLDIR not configured");
       return false;
    }
-   const bool is64 = vp_xlen_is_64();
+   const bool is64 = gpu->xlen == 64;
    const char *target  = is64 ? "riscv64-unknown-elf" : "riscv32-unknown-elf";
    const char *gnu_dir = is64 ? "riscv64-gnu-toolchain" : "riscv32-gnu-toolchain";
    const char *march   = is64 ? "rv64imafd" : "rv32imaf";
@@ -174,31 +210,19 @@ vp_compile_vxbin(const char *llvm_ir, unsigned long long startup_addr,
                               "-funroll-loops -mllvm -unroll-runtime "
                               "-mllvm -enable-post-misched "
                               "-mllvm -riscv-use-rematerializable-movimm";
-   /* Public device resources, never simulator latency or fitted timing. */
-   static const char *resource_options[][2] = {
-      {"VX_CFG_REGISTER_WORDS_PER_SM", "vortex-register-words-per-sm"},
-      {"VX_CFG_REGISTER_ALLOCATION_WORDS", "vortex-register-allocation-words"},
-      {"VX_CFG_MAX_REGISTERS_PER_THREAD", "vortex-max-registers-per-thread"},
-      {"VX_CFG_NUM_THREADS", "vortex-warp-size"},
-      {"VX_CFG_ISSUE_WIDTH", "vortex-register-partitions"},
-   };
-   for (unsigned i = 0; i < ARRAY_SIZE(resource_options); ++i) {
-      const char *value = getenv(resource_options[i][0]);
-      if (!value || !*value) {
-         mesa_loge("vortexpipe: missing public target property %s", resource_options[i][0]);
-         return false;
+   if (gpu->partitions) {
+      const struct { const char *option; unsigned value; } options[] = {
+#define VP_RESOURCE(field, key, option) { option, gpu->field },
+#include "vp_register_resources.def"
+#undef VP_RESOURCE
+      };
+      for (unsigned i = 0; i < ARRAY_SIZE(options); ++i) {
+         size_t used = strlen(simt_options);
+         int added = snprintf(simt_options + used, sizeof(simt_options) - used,
+                              " -mllvm -%s=%u", options[i].option, options[i].value);
+         if (added < 0 || (size_t)added >= sizeof(simt_options) - used)
+            return false;
       }
-      char *end;
-      unsigned long number = strtoul(value, &end, 10);
-      if (*end || !number || number > UINT32_MAX) {
-         mesa_loge("vortexpipe: invalid public target property %s", resource_options[i][0]);
-         return false;
-      }
-      size_t used = strlen(simt_options);
-      int added = snprintf(simt_options + used, sizeof(simt_options) - used,
-                           " -mllvm -%s=%lu", resource_options[i][1], number);
-      if (added < 0 || (size_t)added >= sizeof(simt_options) - used)
-         return false;
    }
    char cache_path[640];
    bool cache_enabled = !getenv("VORTEXPIPE_NO_CACHE");

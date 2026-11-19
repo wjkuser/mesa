@@ -163,14 +163,12 @@ initialize(nir_builder *b, nir_intrinsic_instr *in, nir_deref_instr *state, unsi
    store(b, state, Q_MIN, in->src[5].ssa);
    store(b, state, Q_DIRECTION, in->src[6].ssa);
    store(b, state, Q_MAX, in->src[7].ssa);
-   /* A constant zero visibility mask rejects every instance. Mark the query
-    * complete here so constant propagation removes proceed and its RT request,
-    * while the initialized query fields remain available to query getters. */
-   bool empty_mask = nir_src_is_const(in->src[3]) &&
-                     (nir_src_as_uint(in->src[3]) & 0xffu) == 0;
-   store(b, state, Q_PHASE, empty_mask ? nir_imm_int(b, Q_COMPLETE) :
-         nir_bcsel(b, nir_ieq_imm(b, in->src[1].ssa, 0),
-                   nir_imm_int(b, Q_COMPLETE), nir_imm_int(b, Q_INITIALIZED)));
+   /* Native RayQuery skips the descriptor load and SM-to-RT submission
+    * for a runtime visibility mask with no enabled instance bits. */
+   nir_def *empty = nir_ior(b, nir_ieq_imm(b, nir_iand_imm(b, in->src[3].ssa, 255), 0),
+                              nir_ieq_imm(b, in->src[1].ssa, 0));
+   store(b, state, Q_PHASE, nir_bcsel(b, empty, nir_imm_int(b, Q_COMPLETE),
+                                      nir_imm_int(b, Q_INITIALIZED)));
    store(b, state, Q_ACTION, nir_imm_int(b, VX_RT_ACTION_START));
    store(b, state, Q_GENERATED_T, nir_imm_int(b, 0));
    store(b, state, Q_RANGE_COUNT, nir_imm_int(b, 0));

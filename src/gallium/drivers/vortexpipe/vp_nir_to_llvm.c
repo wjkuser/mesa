@@ -6,7 +6,7 @@
  *
  * Emits a Vortex KMU kernel: `void kernel_main(ptr %arg)`, marked
  * `vortex.kernel` via @llvm.global.annotations, targeting riscv32
- * or riscv64 depending on $MESA_VORTEX_XLEN (see vp_xlen_is_64). Two
+ * or riscv64 according to the opened device. Two
  * shader stages are handled:
  *
  *   - Compute: one thread per work-item. SSBO base addresses come
@@ -22,7 +22,7 @@
 
 #include "vp_nir_to_llvm.h"
 #include "vp_texture_abi.h"
-#include "vp_compile.h"      /* vp_xlen_is_64 */
+#include "vp_compile.h"      /* vp_compiler_target */
 #include "vp_private.h"      /* vp_dbg */
 #ifndef VP_COMPUTE_ONLY
 #include "gfx_fs_desc_abi.h"
@@ -137,14 +137,14 @@
 /* TEX unit: coordinates are S.23 fixed-point (VX_types.h VX_TEX_FXD_FRAC). */
 #define VP_TEX_FXD_FRAC      23
 
-/* Module target -- the LLVM triple + datalayout follow $MESA_VORTEX_XLEN.
+/* Module target -- the LLVM triple + datalayout follow the device XLEN.
  * rv32 datalayout: 32-bit pointers, 32-bit native int.
  * rv64 datalayout: 64-bit pointers (p:64:64), 64-bit native int (n64). */
-static inline const char *vp_target_triple(void) {
-   return vp_xlen_is_64() ? "riscv64-unknown-elf" : "riscv32-unknown-elf";
+static inline const char *vp_target_triple(unsigned xlen) {
+   return xlen == 64 ? "riscv64-unknown-elf" : "riscv32-unknown-elf";
 }
-static inline const char *vp_target_datalayout(void) {
-   return vp_xlen_is_64()
+static inline const char *vp_target_datalayout(unsigned xlen) {
+   return xlen == 64
       ? "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128"
       : "e-m:e-p:32:32-i64:64-n32-S128";
 }
@@ -158,6 +158,7 @@ struct vp_var {
 };
 
 struct vp_tr {
+   const struct vp_compiler_target *gpu;
    LLVMContextRef ctx;
    LLVMModuleRef  mod;
    LLVMBuilderRef b;
@@ -763,7 +764,7 @@ emit_subgroup_incl_scan(struct vp_tr *t, nir_op rop, LLVMValueRef val,
    LLVMValueRef last = LLVMConstInt(t->i32, 31, false);
    LLVMValueRef prev = LLVMBuildSub(t->b, last, emit_ctlz(t, lower), "");
    LLVMValueRef acc = val;
-   unsigned span = cluster ? cluster : 32u;
+   unsigned span = cluster ? cluster : t->gpu->warp_size;
    for (unsigned d = 1; d < span; d <<= 1) {
       LLVMValueRef valid = LLVMBuildICmp(t->b, LLVMIntULT, prev,
          LLVMConstInt(t->i32, 32, false), "");
@@ -777,6 +778,54 @@ emit_subgroup_incl_scan(struct vp_tr *t, nir_op rop, LLVMValueRef val,
       prev = next;
    }
    return acc;
+}
+
+/* On targets without a native REDUX, a dense warp exchanges with its XOR
+ * partners; a sparse warp follows the active predecessors and broadcasts the
+ * last lane's prefix. Do not read a nonparticipating lane in either path. */
+static LLVMValueRef
+emit_shuffle_reduce_min(struct vp_tr *t, LLVMValueRef value)
+{
+   LLVMValueRef active = emit_ballot(t, LLVMConstInt(t->i32, 1, false));
+   LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(t->b));
+   LLVMBasicBlockRef dense = LLVMAppendBasicBlockInContext(t->ctx, fn, "reduce_full");
+   LLVMBasicBlockRef sparse = LLVMAppendBasicBlockInContext(t->ctx, fn, "reduce_sparse");
+   LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(t->ctx, fn, "reduce_done");
+   LLVMBuildCondBr(t->b, LLVMBuildICmp(t->b, LLVMIntEQ, active,
+      LLVMConstInt(t->i32, UINT32_MAX >> (32 - t->gpu->warp_size), false), "full_warp"), dense, sparse);
+
+   LLVMPositionBuilderAtEnd(t->b, dense);
+   LLVMValueRef full_min = value;
+   for (unsigned d = 1; d < t->gpu->warp_size; d <<= 1) {
+      LLVMValueRef other = emit_shfl(t, 6, full_min, LLVMConstInt(t->i32, 0xfc0u | d, false));
+      full_min = emit_scan_combine(t, nir_op_umin, full_min, other);
+   }
+   LLVMBuildBr(t->b, done);
+
+   LLVMPositionBuilderAtEnd(t->b, sparse);
+   LLVMValueRef lane = emit_csr_read(t, VX_CSR_THREAD_ID, "lane");
+   LLVMValueRef one = LLVMConstInt(t->i32, 1, false);
+   LLVMValueRef last = LLVMConstInt(t->i32, 31, false);
+   LLVMValueRef lower = LLVMBuildAnd(t->b, active,
+      LLVMBuildSub(t->b, LLVMBuildShl(t->b, one, lane, ""), one, ""), "");
+   /* highest(0) is UINT32_MAX: the first active lane points to itself. */
+   LLVMValueRef prev = emit_scan_combine(t, nir_op_umin, lane,
+      LLVMBuildSub(t->b, last, emit_ctlz(t, lower), ""));
+   LLVMValueRef partial_min = value;
+   for (unsigned d = 1; d < t->gpu->warp_size; d <<= 1) {
+      LLVMValueRef other = emit_shfl_idx(t, partial_min, prev);
+      partial_min = emit_scan_combine(t, nir_op_umin, partial_min, other);
+      if (2 * d < t->gpu->warp_size)
+         prev = emit_shfl_idx(t, prev, prev);
+   }
+   partial_min = emit_shfl_idx(t, partial_min, LLVMBuildSub(t->b, last, emit_ctlz(t, active), ""));
+   LLVMBuildBr(t->b, done);
+   LLVMPositionBuilderAtEnd(t->b, done);
+   LLVMValueRef result = LLVMBuildPhi(t->b, t->i32, "warp_min");
+   LLVMValueRef results[] = {full_min, partial_min};
+   LLVMBasicBlockRef paths[] = {dense, sparse};
+   LLVMAddIncoming(result, results, paths, 2);
+   return emit_uniform(t, result);
 }
 
 /* vx_barrier(): a workgroup execution barrier (custom-0, funct3=4).
@@ -2566,7 +2615,7 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
        * fit the 32-bit ballot, both of which Vulkan guarantees for a cluster no
        * wider than the subgroup. Refuse anything else rather than fold over the
        * wrong lanes. */
-      if ((cluster & (cluster - 1u)) || cluster > 32u) {
+      if ((cluster & (cluster - 1u)) || cluster > t->gpu->warp_size) {
          mesa_logw("vortexpipe: unsupported subgroup reduce cluster size %u",
                    cluster);
          t->ok = false;
@@ -2579,7 +2628,9 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       }
       nir_op rop  = nir_intrinsic_reduction_op(in);
       if (in->intrinsic == nir_intrinsic_reduce && !cluster && rop == nir_op_umin) {
-         ssa_set(t, in->def.index, 0, emit_reduce_min(t, intr_src(t, in, 0)));
+         LLVMValueRef value = intr_src(t, in, 0);
+         ssa_set(t, in->def.index, 0, t->gpu->native_redux
+            ? emit_reduce_min(t, value) : emit_shuffle_reduce_min(t, value));
          break;
       }
       LLVMValueRef incl = emit_subgroup_incl_scan(t, rop, intr_src(t, in, 0),
@@ -4965,8 +5016,11 @@ emit_cfg(struct vp_tr *t, nir_function_impl *impl,
          LLVMValueRef fn, LLVMBasicBlockRef entry)
 {
    nir_metadata_require(impl, nir_metadata_block_index);
-   LLVMBasicBlockRef *bb = calloc(impl->num_blocks, sizeof(*bb));
+   LLVMBasicBlockRef *bb = calloc(impl->num_blocks * 2, sizeof(*bb));
    if (!bb) { t->ok = false; return; }
+   /* An intrinsic may expand into several LLVM blocks. A NIR phi receives
+    * its input from the block that actually branches to the successor. */
+   LLVMBasicBlockRef *exit_bb = bb + impl->num_blocks;
 
    /* one LLVM block per NIR block; block 0 reuses `entry` so the
     * kernel prologue stays contiguous with the first NIR block. */
@@ -4983,6 +5037,7 @@ emit_cfg(struct vp_tr *t, nir_function_impl *impl,
       nir_foreach_instr(instr, blk) {
          if (!emit_instr(t, instr)) { free(t->float_types); free(bb); return; }
       }
+      exit_bb[blk->index] = LLVMGetInsertBlock(t->b);
       nir_if *nif = nir_block_get_following_if(blk);
       if (nif) {
          LLVMValueRef c = ssa_get(t, nif->condition.ssa->index, 0);
@@ -5011,7 +5066,7 @@ emit_cfg(struct vp_tr *t, nir_function_impl *impl,
             if (!llphi)
                continue;
             nir_foreach_phi_src(src, phi) {
-               LLVMBasicBlockRef pred = bb[src->pred->index];
+               LLVMBasicBlockRef pred = exit_bb[src->pred->index];
                LLVMPositionBuilderBefore(t->b, LLVMGetBasicBlockTerminator(pred));
                LLVMValueRef v = ssa_get(t, src->src.ssa->index, c);
                if (v) {
@@ -6313,7 +6368,7 @@ emit_load_i32(struct vp_tr *t, LLVMValueRef addr)
 #endif
 
 bool
-vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
+vp_nir_to_llvm(const struct vp_compiler_target *gpu, struct nir_shader *nir, char **out_ir,
                struct vp_vs_layout *out_vs,
                const struct vp_sw_routing *routing,
                unsigned samples, uint8_t bgra_mask)
@@ -6322,7 +6377,7 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
       *out_ir = NULL;
    if (out_vs)
       memset(out_vs, 0, sizeof *out_vs);
-   if (!nir)
+   if (!nir || !gpu->warp_size)
       return false;
    /* Integer division uses reciprocal estimation, multiplication and exact
     * remainder correction on GPU arithmetic pipelines. */
@@ -6393,7 +6448,7 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
    }
 
 #endif
-   struct vp_tr t = {0};
+   struct vp_tr t = { .gpu = gpu };
    t.preserve_fp32_denorms = nir_is_denorm_preserve(
       nir->info.float_controls_execution_mode, 32);
    t.ok    = true;
@@ -6414,14 +6469,14 @@ vp_nir_to_llvm(struct nir_shader *nir, char **out_ir,
    t.fs_bgra_mask = t.is_fs ? bgra_mask : 0u;
    t.ctx   = LLVMContextCreate();
    t.mod   = LLVMModuleCreateWithNameInContext("vortex_shader", t.ctx);
-   LLVMSetTarget(t.mod, vp_target_triple());
-   LLVMSetDataLayout(t.mod, vp_target_datalayout());
+   LLVMSetTarget(t.mod, vp_target_triple(gpu->xlen));
+   LLVMSetDataLayout(t.mod, vp_target_datalayout(gpu->xlen));
    t.b   = LLVMCreateBuilderInContext(t.ctx);
    t.i8  = LLVMInt8TypeInContext(t.ctx);
    t.i32 = LLVMInt32TypeInContext(t.ctx);
    t.i64 = LLVMInt64TypeInContext(t.ctx);
    /* Pointer-sized int -- matches the module's target datalayout above. */
-   t.iptr = vp_xlen_is_64() ? t.i64 : t.i32;
+   t.iptr = gpu->xlen == 64 ? t.i64 : t.i32;
    t.f32 = LLVMFloatTypeInContext(t.ctx);
    t.f64 = LLVMDoubleTypeInContext(t.ctx);
    t.ptr = LLVMPointerTypeInContext(t.ctx, 0);

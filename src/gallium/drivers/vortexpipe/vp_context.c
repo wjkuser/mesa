@@ -156,8 +156,8 @@ vp_create_compute_state(struct pipe_context *pipe,
       /* raw const-index shader-buffer slots (RT trace-ray command buffer) ->
        * SBT shader-record pointer relocation at launch. */
       cso->trace_cmd_slots = vp_scan_trace_cmd_slots(cs_nir);
-      if (vp_nir_to_llvm(cs_nir, &ir, NULL, NULL, 1, 0)) {
-         if (vp_compile_vxbin(ir, VP_STARTUP_FS, false, &cso->vxbin, &cso->vxbin_size))
+      if (vp_nir_to_llvm(vp->target, cs_nir, &ir, NULL, NULL, 1, 0)) {
+         if (vp_compile_vxbin(vp->target, ir, VP_STARTUP_FS, false, &cso->vxbin, &cso->vxbin_size))
             vp_dbg("vortexpipe: compiled shader -> %zu-byte .vxbin",
                       cso->vxbin_size);
          else
@@ -286,7 +286,7 @@ vp_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
                 block_size,
                 info->block[0], info->block[1], info->block[2],
                 vps->hw_max_block_size,
-                vps->hw_num_threads, vps->hw_num_warps);
+                vps->target.warp_size, vps->hw_num_warps);
       goto fallback;
    }
 
@@ -505,11 +505,11 @@ vp_create_vs_state(struct pipe_context *pipe,
    /* Translate the vertex shader NIR -> LLVM IR -> Vortex .vxbin. */
    if (vs_nir) {
       char *ir = NULL;
-      if (vp_nir_to_llvm(vs_nir, &ir,
+      if (vp_nir_to_llvm(vp->target, vs_nir, &ir,
                          &cso->vs_layout, NULL, 1, 0)) {
          /* VS links at a distinct base so it co-resides with the FS
           * (0x80000000) + front end (0x80200000) in one OP_DRAW. */
-         if (vp_compile_vxbin(ir, VP_STARTUP_VS, false, &cso->vxbin, &cso->vxbin_size))
+         if (vp_compile_vxbin(vp->target, ir, VP_STARTUP_VS, false, &cso->vxbin, &cso->vxbin_size))
             vp_dbg("vortexpipe: compiled vertex shader -> %zu-byte .vxbin",
                    cso->vxbin_size);
          else
@@ -723,7 +723,7 @@ vp_fs_key_equal(const struct vp_fs_variant_key *a,
  * false and leaves the slot empty when the shader cannot be built for this key;
  * the caller then falls through to llvmpipe. */
 static bool
-vp_fs_variant_compile(struct vp_cso *cso, struct vp_fs_variant *v,
+vp_fs_variant_compile(const struct vp_compiler_target *gpu, struct vp_cso *cso, struct vp_fs_variant *v,
                       bool *out_toolchain_failed)
 {
    char *ir = NULL;
@@ -732,7 +732,7 @@ vp_fs_variant_compile(struct vp_cso *cso, struct vp_fs_variant *v,
     * implement -- a feature-coverage gap, which the compute and vertex paths
     * also report as a warning. Only the toolchain failing afterwards is an
     * error, and the caller needs the two apart to say which happened. */
-   if (!vp_nir_to_llvm(cso->fs_nir, &ir, NULL, &v->key.routing, v->key.samples,
+   if (!vp_nir_to_llvm(gpu, cso->fs_nir, &ir, NULL, &v->key.routing, v->key.samples,
                        v->key.bgra_mask))
       return false;
    /* Co-compile the gfx_sw ABI whenever this variant could call it -- a
@@ -741,7 +741,7 @@ vp_fs_variant_compile(struct vp_cso *cso, struct vp_fs_variant *v,
     * derived from the routing the variant was built with. */
    const bool uses_sw = v->key.routing.sw_tex || v->key.routing.sw_om ||
                         cso->has_tex_desc;
-   const bool ok = vp_compile_vxbin(ir, VP_STARTUP_FS, uses_sw,
+   const bool ok = vp_compile_vxbin(gpu, ir, VP_STARTUP_FS, uses_sw,
                                     &v->vxbin, &v->vxbin_size);
    vp_free_ir(ir);
    *out_toolchain_failed = !ok;
@@ -751,7 +751,7 @@ vp_fs_variant_compile(struct vp_cso *cso, struct vp_fs_variant *v,
 /* Resolve the variant for `key`, compiling it on first use. Returns NULL when
  * the shader has no device path for this key. */
 static struct vp_fs_variant *
-vp_fs_variant_get(struct vp_cso *cso, const struct vp_fs_variant_key *key)
+vp_fs_variant_get(const struct vp_compiler_target *gpu, struct vp_cso *cso, const struct vp_fs_variant_key *key)
 {
    for (unsigned i = 0; i < cso->num_fs_variants; i++) {
       if (vp_fs_key_equal(&cso->fs_variants[i].key, key))
@@ -771,7 +771,7 @@ vp_fs_variant_get(struct vp_cso *cso, const struct vp_fs_variant_key *key)
    v->key = *key;
    cso->num_fs_variants++;
    bool toolchain_failed = false;
-   if (!vp_fs_variant_compile(cso, v, &toolchain_failed)) {
+   if (!vp_fs_variant_compile(gpu, cso, v, &toolchain_failed)) {
       if (toolchain_failed) {
          mesa_loge("vortexpipe: FS variant .vxbin compile failed");
       } else {
@@ -870,7 +870,7 @@ vp_create_fs_state(struct pipe_context *pipe,
        * variant on its first draw instead. */
       const struct vp_fs_variant_key k0 =
          vp_fs_key_make(&cso->fs_routing, 1, 0);
-      if (!vp_fs_variant_get(cso, &k0)) {
+      if (!vp_fs_variant_get(vp->target, cso, &k0)) {
          mesa_logw("vortexpipe: FS NIR->LLVM unavailable; "
                    "fragment stage runs on llvmpipe");
       }
@@ -3157,7 +3157,7 @@ vp_draw_vbo(struct pipe_context *pipe,
          }
          const struct vp_fs_variant_key key =
             vp_fs_key_make(&routing, vp->fb_samples, vp->fb_color_bgra_mask);
-         fsv = vp_fs_variant_get(fs, &key);
+         fsv = vp_fs_variant_get(vp->target, fs, &key);
       }
 
       /* Gather the vertex-buffer geometry if the VS fetches inputs;
@@ -3944,7 +3944,8 @@ vp_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       return pipe;          /* degrade to plain llvmpipe context */
 
    vp->dev                     = vps->dev;
-   vp->raster_pool             = vp_raster_pool_create();
+   vp->target                  = &vps->target;
+   vp->raster_pool             = vp_raster_pool_create(vps->target.xlen);
    vp->lp_create_compute_state = pipe->create_compute_state;
    vp->lp_bind_compute_state   = pipe->bind_compute_state;
    vp->lp_delete_compute_state = pipe->delete_compute_state;
