@@ -18,10 +18,33 @@ using namespace vortex::rtu;
 
 class Scene {
 public:
+   explicit Scene(vp_as_ctx *ctx) : ctx(ctx) {}
+   vp_as_ctx *ctx;
+   struct Blas { uint32_t address, size; };
+   std::unordered_map<const void *, Blas> blases;
    BvhLayout layout = BvhLayout::from_environment();
    std::vector<uint8_t> bytes = std::vector<uint8_t>(RTU_BVH_SCENE_HDR_BYTES);
    std::vector<std::array<uint8_t, RTU_INSTANCE_METADATA_BYTES>> instances;
-   std::unordered_map<const void *, uint32_t> roots;
+   Blas relocate_blas(const void *source)
+   {
+      auto found = blases.find(source);
+      if (found != blases.end())
+         return found->second;
+      Scene child(ctx);
+      child.bytes.clear();
+      if (child.build(source) != 0)
+         throw std::runtime_error("BLAS root must start its allocation");
+      uint32_t size = child.bytes.size();
+      auto *copy = static_cast<uint8_t *>(malloc(size));
+      if (!copy) throw std::bad_alloc();
+      memcpy(copy, child.bytes.data(), size);
+      uint64_t address = vp_as_resident_address(ctx, source, copy, size);
+      if (!address || address > UINT32_MAX)
+         throw std::runtime_error("could not allocate addressable BLAS storage");
+      Blas blas{uint32_t(address), size};
+      blases.emplace(source, blas);
+      return blas;
+   }
 
    template<typename T> uint32_t append(const T &value)
    {
@@ -33,9 +56,6 @@ public:
 
    uint32_t build(const void *base)
    {
-      auto found = roots.find(base);
-      if (found != roots.end())
-         return found->second;
       std::vector<vortex::raytrace::BvhPrimitive> primitives;
       collect(static_cast<const uint8_t *>(base), LVP_BVH_ROOT_NODE, primitives);
       std::stable_sort(primitives.begin(), primitives.end(), [](const auto &a, const auto &b) {
@@ -47,7 +67,6 @@ public:
       uint32_t root = vortex::raytrace::append_bvh(primitives, layout, bytes);
       if (root == UINT32_MAX)
          throw std::runtime_error("RTU BVH exceeds leaf address range");
-      roots.emplace(base, root);
       return root;
    }
 
@@ -134,10 +153,11 @@ public:
       case lvp_bvh_node_instance: {
          const auto &src = *static_cast<const lvp_bvh_instance_node *>(source);
          VxBvhInstance instance{};
-         instance.blas_root_byte_offset = build(reinterpret_cast<const void *>(src.bvh_ptr));
+         const auto blas = relocate_blas(reinterpret_cast<const void *>(src.bvh_ptr));
+         instance.blas_root_byte_offset = blas.address;
          memcpy(instance.xform, src.otw_matrix.values, sizeof(instance.xform));
          instance.custom_id = src.custom_instance_and_mask & 0xffffffu;
-         instance.instance_id = src.instance_id;
+         instance.instance_id = blas.size;
          uint32_t flags = src.sbt_offset_and_flags;
          uint32_t native_flags =
             ((flags & LVP_INSTANCE_TRIANGLE_FACING_CULL_DISABLE) ? RTU_INST_FLAG_TRI_CULL_DIS : 0) |
@@ -153,9 +173,25 @@ public:
          memcpy(metadata.data() + 48, src.wto_matrix.values, 48);
          uint32_t sbt_offset = flags & 0xffffffu;
          memcpy(metadata.data() + RTU_INSTANCE_METADATA_SBT_OFFSET, &sbt_offset, 4);
+         memcpy(metadata.data() + RTU_INSTANCE_METADATA_CUSTOM_OFFSET, &instance.custom_id, 4);
          bytes.resize((bytes.size() + 15) & ~size_t(15), 0);
+         const char *record_bytes = std::getenv("HACKRTCORE_RTU_INSTANCE_RECORD_BYTES");
+         if (record_bytes && !std::strcmp(record_bytes, "64") &&
+             layout.width <= kVxBvhCompactInstanceSlots && (blas.address & 15u) == 0) {
+            VxBvhCompactInstance record{};
+            record.blas_address_and_flags = blas.address | native_flags;
+            record.blas_bytes = blas.size;
+            record.instance_id = src.instance_id;
+            record.sbt_offset_and_mask = sbt_offset | (src.custom_instance_and_mask & 0xff000000u);
+            memcpy(record.world_to_object, src.wto_matrix.values, sizeof(record.world_to_object));
+            uint32_t offset = append(VxBvhLeafHeader{
+               RTU_BVH_KIND_LEAF_INST | (1u << RTU_BVH_COUNT_SHIFT), 0,
+               RTU_BVH_INSTANCE_EXTERNAL_BLAS | RTU_BVH_INSTANCE_COMPACT_RECORD, src.instance_id});
+            append(record);
+            return offset;
+         }
          uint32_t offset = append(VxBvhLeafHeader{
-            RTU_BVH_KIND_LEAF_INST | (1u << RTU_BVH_COUNT_SHIFT), 0, 0, src.instance_id});
+            RTU_BVH_KIND_LEAF_INST | (1u << RTU_BVH_COUNT_SHIFT), 0, RTU_BVH_INSTANCE_EXTERNAL_BLAS, src.instance_id});
          append(instance);
          return offset;
       }
@@ -168,9 +204,9 @@ public:
 }
 
 extern "C" uint8_t *
-vp_build_scene(const void *acceleration_structure, uint32_t *size)
-{
-   Scene scene;
+vp_build_scene(vp_as_ctx *ctx, const void *acceleration_structure, uint32_t *size)
+try {
+   Scene scene(ctx);
    uint32_t root = scene.build(acceleration_structure);
    uint32_t table = scene.bytes.size();
    for (const auto &instance : scene.instances)
@@ -182,4 +218,6 @@ vp_build_scene(const void *acceleration_structure, uint32_t *size)
    if (result)
       memcpy(result, scene.bytes.data(), *size);
    return result;
+} catch (const std::exception &) {
+   return nullptr;
 }

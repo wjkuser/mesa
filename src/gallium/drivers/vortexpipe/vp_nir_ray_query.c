@@ -11,7 +11,7 @@
 /* Per-query shader state. Arrays retain the application's array dimensions. */
 enum query_word {
    Q_SCENE, Q_FLAGS, Q_MASK, Q_ORIGIN, Q_DIRECTION = Q_ORIGIN + 3,
-   Q_MIN = Q_DIRECTION + 3, Q_MAX, Q_HANDLE, Q_PHASE, Q_ACTION, Q_GENERATED_T,
+   Q_MIN = Q_DIRECTION + 3, Q_HANDLE, Q_PHASE, Q_ACTION,
    Q_RANGE_ADDRESS, Q_RANGE_COUNT, Q_RANGE_CURSOR, Q_RETURN_FLAGS,
    Q_CANDIDATE = 32, Q_COMMITTED = Q_CANDIDATE + VX_RT_SLOT_COUNT,
    Q_WORDS = Q_COMMITTED + VX_RT_SLOT_COUNT,
@@ -111,10 +111,12 @@ vp_nir_decode_geometry(nir_builder *b, nir_def *reference, nir_def *is_procedura
 
 static void
 snapshot(nir_builder *b, nir_deref_instr *state, unsigned bank,
-         nir_def *token, bool committed_registers)
+         nir_def *token, bool committed_registers, nir_def *distance, nir_def *record)
 {
-   /* A snapshot observes one immutable returned record. Reuse its flags;
-    * candidate event classification already identifies procedural records. */
+   /* For triangle intersections the event word already holds barycentric V.
+    * AABB and generated intersections have no Vulkan barycentric attributes.
+    * A separate committed bank belongs to an earlier event, so read that
+    * bank's own distance and V when the caller supplies no event payload. */
    nir_def *flags = committed_registers
       ? nir_vortex_rt_get_committed(b, 32, token, .base = VX_RT_HIT_FLAGS)
       : nir_vortex_rt_get(b, 32, token, .base = VX_RT_HIT_FLAGS);
@@ -131,7 +133,9 @@ snapshot(nir_builder *b, nir_deref_instr *state, unsigned bank,
    for (unsigned i = 0; i < ARRAY_SIZE(hit_slots); ++i) {
       unsigned slot = hit_slots[i];
       if (committed_registers && slot == VX_RT_HIT_FLAGS) continue;
-      nir_def *value = slot == VX_RT_HIT_FLAGS ? flags : committed_registers
+      nir_def *value = slot == VX_RT_HIT_T && distance ? distance :
+         slot == VX_RT_HIT_BARY_V && record ? record :
+         slot == VX_RT_HIT_FLAGS ? flags : committed_registers
          ? nir_vortex_rt_get_committed(b, 32, token, .base = slot)
          : nir_vortex_rt_get(b, 32, token, .base = slot);
       if (slot == VX_RT_HIT_T) value = nir_iand_imm(b, value, 0x7fffffff);
@@ -162,7 +166,6 @@ initialize(nir_builder *b, nir_intrinsic_instr *in, nir_deref_instr *state, unsi
    store(b, state, Q_ORIGIN, in->src[4].ssa);
    store(b, state, Q_MIN, in->src[5].ssa);
    store(b, state, Q_DIRECTION, in->src[6].ssa);
-   store(b, state, Q_MAX, in->src[7].ssa);
    /* Native RayQuery skips the descriptor load and SM-to-RT submission
     * for a runtime visibility mask with no enabled instance bits. */
    nir_def *empty = nir_ior(b, nir_ieq_imm(b, nir_iand_imm(b, in->src[3].ssa, 255), 0),
@@ -170,7 +173,6 @@ initialize(nir_builder *b, nir_intrinsic_instr *in, nir_deref_instr *state, unsi
    store(b, state, Q_PHASE, nir_bcsel(b, empty, nir_imm_int(b, Q_COMPLETE),
                                       nir_imm_int(b, Q_INITIALIZED)));
    store(b, state, Q_ACTION, nir_imm_int(b, VX_RT_ACTION_START));
-   store(b, state, Q_GENERATED_T, nir_imm_int(b, 0));
    store(b, state, Q_RANGE_COUNT, nir_imm_int(b, 0));
    store(b, state, Q_RANGE_CURSOR, nir_imm_int(b, 0));
    store(b, state, Q_COMMITTED + VX_RT_HIT_FLAGS, nir_imm_int(b, 0));
@@ -236,13 +238,13 @@ check_micromap(nir_builder *b, nir_deref_instr *state, unsigned bank)
 }
 
 static void
-snapshot_terminal(nir_builder *b, nir_deref_instr *state, nir_def *status)
+snapshot_terminal(nir_builder *b, nir_deref_instr *state, nir_def *status, nir_def *distance, nir_def *record)
 {
    /* Completion and a committed hit are different results. Native query
     * lowering classifies the returned record before decoding hit attributes;
     * a miss has no instance record for the software micromap check either. */
    nir_push_if(b, nir_ieq_imm(b, status, VX_RT_STS_DONE_HIT));
-   snapshot(b, state, Q_COMMITTED, status, false);
+   snapshot(b, state, Q_COMMITTED, status, false, distance, record);
    check_micromap(b, state, Q_COMMITTED);
    nir_push_else(b, NULL);
    store(b, state, Q_COMMITTED + VX_RT_HIT_FLAGS, nir_imm_int(b, 0));
@@ -270,7 +272,6 @@ proceed(nir_builder *b, nir_deref_instr *state, nir_def *continuation)
    nir_pop_if(b, NULL);
    nir_vortex_rt_set(b, continuation, .base = VX_RT_QUERY_CONTEXT);
    nir_vortex_rt_set(b, load(b, state, Q_ACTION), .base = VX_RT_QUERY_ACTION);
-   nir_vortex_rt_set(b, load(b, state, Q_GENERATED_T), .base = VX_RT_QUERY_DISTANCE);
    nir_def *flags = nir_ior(b, nir_ior(b, load(b, state, Q_FLAGS), load(b, state, Q_RETURN_FLAGS)),
        nir_ishl_imm(b, nir_iand_imm(b, load(b, state, Q_MASK), 255), 16));
    /* A new traversal consumes the AS root descriptor. A resumed traversal
@@ -289,19 +290,36 @@ proceed(nir_builder *b, nir_deref_instr *state, nir_def *continuation)
    nir_def *unused_descriptor = nir_imm_ivec2(b, 0, 0);
    nir_pop_if(b, NULL);
    descriptor = nir_if_phi(b, descriptor, unused_descriptor);
+   /* CP_WRITE 0x50 takes the original upper bound for a new ray and
+    * the accepted distance on resume. This word is shared by both paths. */
    store(b, state, Q_HANDLE, nir_vortex_rt_wtrace_prepared(b, 32,
        load(b, state, Q_SCENE), flags, load_vector(b, state, Q_ORIGIN, 3),
        load_vector(b, state, Q_DIRECTION, 3),
-       load(b, state, Q_MIN), load(b, state, Q_MAX), descriptor));
+       load(b, state, Q_MIN), load(b, state, Q_COMMITTED + VX_RT_HIT_T), descriptor));
 
    nir_def *token = nir_vortex_rt_event_wait(b, 32, load(b, state, Q_HANDLE));
+   nir_def *distance = NULL, *record = NULL;
+#ifdef VP_HACKRTCORE
+   /* Native CP_READ 0x300 word 3 carries triangle V or the procedural
+    * type/count. EVENT_WAIT exposes that word in our ISA. Word 1 carries
+    * signed distance for triangle hits. Keep both for this event. */
+   record = token;
+   distance = nir_vortex_rt_get(b, 32, record, .base = VX_RT_HIT_T);
+   nir_def *procedural = nir_iand(b,
+      nir_ieq_imm(b, nir_iand_imm(b, record, VX_RT_RESULT_TYPE_MASK), VX_RT_RESULT_PROCEDURAL),
+      nir_ine_imm(b, nir_iand_imm(b, record, VX_RT_RESULT_COUNT_MASK), 0));
+   nir_def *triangle = nir_ilt_imm(b, nir_iand(b, nir_inot(b, record), distance), 0);
+   token = nir_bcsel(b, procedural, nir_imm_int(b, VX_RT_EVENT_AABB),
+      nir_bcsel(b, triangle, nir_imm_int(b, VX_RT_EVENT_TRIANGLE),
+                nir_imm_int(b, VX_RT_EVENT_COMPLETE)));
+#endif
    nir_push_if(b, nir_ieq_imm(b, token, VX_RT_EVENT_COMPLETE));
    nir_def *terminal = nir_vortex_rt_wait(b, 32, load(b, state, Q_HANDLE));
-   snapshot_terminal(b, state, terminal);
+   snapshot_terminal(b, state, terminal, distance, record);
    store(b, state, Q_PHASE, nir_imm_int(b, Q_COMPLETE));
    nir_push_else(b, NULL);
-   snapshot(b, state, Q_CANDIDATE, token, false);
-   snapshot(b, state, Q_COMMITTED, token, true);
+   snapshot(b, state, Q_CANDIDATE, token, false, distance, record);
+   snapshot(b, state, Q_COMMITTED, token, true, NULL, NULL);
    nir_push_if(b, nir_ieq_imm(b, token, VX_RT_EVENT_TRIANGLE));
    check_micromap(b, state, Q_CANDIDATE);
    nir_pop_if(b, NULL);
@@ -358,8 +376,15 @@ query_value(nir_builder *b, nir_intrinsic_instr *in, nir_deref_instr *state)
       return load(b, state, bank + VX_RT_HIT_GEOMETRY_INDEX);
    case nir_ray_query_value_intersection_instance_id:
       return load(b, state, bank + VX_RT_HIT_INSTANCE_ID);
-   case nir_ray_query_value_intersection_instance_custom_index:
-      return load(b, state, bank + VX_RT_HIT_INSTANCE_CUSTOM);
+   case nir_ray_query_value_intersection_instance_custom_index: {
+      nir_def *value = load(b, state, bank + VX_RT_HIT_INSTANCE_CUSTOM);
+      nir_push_if(b, nir_ieq_imm(b, value, RTU_INSTANCE_CUSTOM_FROM_TABLE));
+      nir_def *address = nir_iadd_imm(b, instance_record(b, state, bank),
+                                     RTU_INSTANCE_METADATA_CUSTOM_OFFSET);
+      nir_def *custom = nir_load_global_constant(b, nir_u2u64(b, address), 4, 1, 32);
+      nir_pop_if(b, NULL);
+      return nir_if_phi(b, custom, value);
+   }
    case nir_ray_query_value_intersection_front_face:
       return nir_ieq_imm(b, load(b, state, bank + VX_RT_HIT_ATTR_0), 0xfe);
    case nir_ray_query_value_intersection_candidate_aabb_opaque:
@@ -493,7 +518,6 @@ vp_nir_lower_ray_tracing_to_rtu(nir_shader *shader)
                nir_fge(&b, load(&b, state, Q_COMMITTED + VX_RT_HIT_T), t)));
             commit_candidate(&b, state);
             store(&b, state, Q_COMMITTED + VX_RT_HIT_T, t);
-            store(&b, state, Q_GENERATED_T, t);
             store(&b, state, Q_ACTION, nir_imm_int(&b, VX_RT_ACTION_GENERATE));
             nir_pop_if(&b, NULL);
             break;

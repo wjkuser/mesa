@@ -1705,8 +1705,10 @@ lvp_trace_ray_query(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *co
    struct lvp_ray_flags ray_flags = {
       .terminate_on_first_hit = nir_test_mask(b, flags, SpvRayFlagsTerminateOnFirstHitKHRMask),
    };
+   /* The first traversal installs the ray. Only a returned candidate enters
+    * the callback loop. Later proceeds resume the returned traversal. */
+   nir_push_if(b, nir_rq_proceed(b, 1, query));
    nir_push_loop(b);
-   nir_break_if(b, nir_inot(b, nir_rq_proceed(b, 1, query)));
    lvp_rtu_instance(b, state, query, scene, false);
    struct lvp_leaf_intersection leaf = {
       .primitive_id = lvp_rtu_query_value(b, query, nir_ray_query_value_intersection_primitive_index, false),
@@ -1749,7 +1751,9 @@ lvp_trace_ray_query(nir_builder *b, struct lvp_ray_tracing_pipeline_compiler *co
    nir_rq_terminate(b, query);
    nir_jump(b, nir_jump_break);
    nir_pop_if(b, NULL);
+   nir_break_if(b, nir_inot(b, nir_rq_proceed(b, 1, query)));
    nir_pop_loop(b, NULL);
+   nir_pop_if(b, NULL);
 
    nir_def *committed_type = lvp_rtu_query_value(b, query, nir_ray_query_value_intersection_type, true);
    nir_def *hit = nir_ine_imm(b, committed_type, 0);
@@ -2269,9 +2273,13 @@ lvp_lower_ray_tracing_instr(nir_builder *b, nir_instr *instr, void *data)
       break;
    case nir_intrinsic_load_ray_instance_custom_index: {
       if (compiler->pipeline->device->pscreen->caps.driver_ray_queries) {
-         /* RTU path: the custom index was staged from the RTU hit, not fetched
-          * from an instance node the software walker would have visited. */
-         def = nir_iand_imm(b, nir_load_var(b, state->rtu_instance_custom_index), 0xFFFFFF);
+         nir_def *value = nir_load_var(b, state->rtu_instance_custom_index);
+         nir_push_if(b, nir_ieq_imm(b, value, RTU_INSTANCE_CUSTOM_FROM_TABLE));
+         nir_def *address = nir_iadd_imm(b, nir_load_var(b, state->instance_addr),
+                                        RTU_INSTANCE_METADATA_CUSTOM_OFFSET);
+         nir_def *custom = nir_load_global_constant(b, address, 4, 1, 32);
+         nir_pop_if(b, NULL);
+         def = nir_iand_imm(b, nir_if_phi(b, custom, value), 0xffffff);
          break;
       }
       nir_def *instance_node_addr = nir_load_var(b, state->instance_addr);

@@ -19,6 +19,11 @@ extern "C" {
 struct nir_shader;
 struct nir_builder;
 struct nir_def;
+struct LLVMOpaqueModule;
+struct LLVMOpaqueValue;
+bool vp_rt_flags_have_mask(struct LLVMOpaqueModule *module, struct LLVMOpaqueValue *flags,
+                           uint32_t mask);
+void vp_lower_rt_resume_loops(struct LLVMOpaqueModule *module);
 
 /* Decode the tagged RT triangle reference on the shader execution path. */
 struct nir_def *vp_nir_decode_primitive(struct nir_builder *b,

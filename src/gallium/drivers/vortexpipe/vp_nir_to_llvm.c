@@ -47,6 +47,7 @@
 
 #include <llvm-c/Core.h>
 #include <llvm-c/Analysis.h>
+#include <llvm-c/DebugInfo.h>
 
 #define VP_MAXC 4    /* max vector components per NIR def */
 #define VP_MAXV 64   /* max tracked variables per shader */
@@ -2778,41 +2779,8 @@ emit_intrinsic(struct vp_tr *t, nir_intrinsic_instr *in)
       break;
    }
    case nir_intrinsic_vortex_rt_event_wait: {
-#ifdef VP_HACKRTCORE
-      /* Expand the event intrinsic at the ISA boundary. All classification
-       * instructions execute on the SM, using the returned type/count and
-       * signed distance. Keep the expansion together with its dependency wait,
-       * like the multi-instruction request intrinsic below. */
-      char assembly[768];
-      snprintf(assembly, sizeof assembly,
-         ".insn r 43, 7, 2, $0, $4, x0\n\t"
-         ".insn r 43, 6, %u, $1, $0, x1\n\t"
-         "srli $2, $0, 25\n\t"
-         "xori $2, $2, %u\n\t"
-         "seqz $2, $2\n\t"
-         "andi $3, $0, %u\n\t"
-         "snez $3, $3\n\t"
-         "and $2, $2, $3\n\t"
-         "not $0, $0\n\t"
-         "and $0, $0, $1\n\t"
-         "srli $0, $0, 31\n\t"
-         "addi $2, $2, %u\n\t"
-         "sub $0, $2, $0",
-         (VX_RT_HIT_T << 2) | 3, VX_RT_RESULT_PROCEDURAL >> 25,
-         VX_RT_RESULT_COUNT_MASK, VX_RT_EVENT_COMPLETE);
-      LLVMTypeRef outputs[] = {t->i32, t->i32, t->i32, t->i32};
-      LLVMTypeRef result_type = LLVMStructTypeInContext(t->ctx, outputs, 4, false);
-      LLVMTypeRef type = LLVMFunctionType(result_type, &t->i32, 1, false);
-      const char *constraints = "=&r,=&r,=&r,=&r,r,~{memory}";
-      LLVMValueRef instruction = LLVMGetInlineAsm(type, assembly, strlen(assembly),
-         constraints, strlen(constraints), true, false, LLVMInlineAsmDialectATT, false);
-      LLVMValueRef handle = ssa_get(t, in->src[0].ssa->index, 0);
-      LLVMValueRef words = LLVMBuildCall2(t->b, type, instruction, &handle, 1, "rt_words");
-      ssa_set(t, in->def.index, 0, LLVMBuildExtractValue(t->b, words, 0, "rt_event"));
-#else
       ssa_set(t, in->def.index, 0, emit_rt_control(t, 2,
          ssa_get(t, in->src[0].ssa->index, 0), LLVMConstInt(t->i32, 0, false)));
-#endif
       break;
    }
    case nir_intrinsic_vortex_rt_action:
@@ -5005,6 +4973,74 @@ lower_uniform_dispatch_tables(struct vp_tr *t, LLVMValueRef fn)
    }
 }
 
+/* The native compiler partially unrolls counted arithmetic loops even with
+ * DontUnroll. Keep the hint on loops with internal control flow or effects. */
+static bool
+is_arithmetic_loop(nir_loop *loop)
+{
+   nir_foreach_block_in_cf_node(block, &loop->cf_node) {
+      if (block->cf_node.parent != &loop->cf_node &&
+          block->cf_node.parent->parent != &loop->cf_node)
+         return false;
+
+      nir_if *nif = nir_block_get_following_if(block);
+      if (nif && !nir_block_ends_in_break(nir_if_last_then_block(nif)) &&
+                 !nir_block_ends_in_break(nir_if_last_else_block(nif)))
+         return false;
+
+      nir_foreach_instr(instr, block) {
+         switch (instr->type) {
+         case nir_instr_type_alu:
+         case nir_instr_type_phi:
+         case nir_instr_type_load_const:
+         case nir_instr_type_jump:
+            break;
+         case nir_instr_type_intrinsic: {
+            nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+            if (op != nir_intrinsic_load_ubo && op != nir_intrinsic_load_push_constant)
+               return false;
+            break;
+         }
+         default:
+            return false;
+         }
+      }
+   }
+   return true;
+}
+
+/* NIR has one preheader per structured loop. LLVM reads the loop ID from
+ * each latch, including explicit continues that branch to the header. */
+static void
+emit_loop_unroll_control(struct vp_tr *t, nir_block *header,
+                         LLVMBasicBlockRef *exit_bb)
+{
+   nir_cf_node *parent = header->cf_node.parent;
+   if (parent->type != nir_cf_node_loop)
+      return;
+   nir_loop *loop = nir_cf_node_as_loop(parent);
+   if (loop->control != nir_loop_control_dont_unroll ||
+       header != nir_loop_first_block(loop) || is_arithmetic_loop(loop))
+      return;
+
+   const char attr[] = "llvm.loop.unroll.disable";
+   LLVMMetadataRef name = LLVMMDStringInContext2(t->ctx, attr, sizeof(attr) - 1);
+   LLVMMetadataRef prop = LLVMMDNodeInContext2(t->ctx, &name, 1);
+   LLVMMetadataRef temp = LLVMTemporaryMDNode(t->ctx, NULL, 0);
+   LLVMMetadataRef operands[] = {temp, prop};
+   LLVMMetadataRef id = LLVMMDNodeInContext2(t->ctx, operands, 2);
+   LLVMMetadataReplaceAllUsesWith(temp, id);
+
+   unsigned kind = LLVMGetMDKindIDInContext(t->ctx, "llvm.loop", 9);
+   nir_block *preheader = nir_block_cf_tree_prev(header);
+   set_foreach(header->predecessors, entry) {
+      nir_block *pred = (nir_block *)entry->key;
+      if (pred != preheader)
+         LLVMSetMetadata(LLVMGetBasicBlockTerminator(exit_bb[pred->index]),
+                         kind, LLVMMetadataAsValue(t->ctx, id));
+   }
+}
+
 /* Translate a function's control-flow graph. One LLVM basic block per
  * NIR block; the branch out of each is taken straight from NIR's
  * per-block successors -- a following nir_if becomes a conditional
@@ -5057,6 +5093,7 @@ emit_cfg(struct vp_tr *t, nir_function_impl *impl,
 
    /* deferred pass: wire each phi's incoming { value, predecessor }. */
    nir_foreach_block(blk, impl) {
+      emit_loop_unroll_control(t, blk, exit_bb);
       nir_foreach_instr(instr, blk) {
          if (instr->type != nir_instr_type_phi)
             continue;
@@ -6521,11 +6558,18 @@ vp_nir_to_llvm(const struct vp_compiler_target *gpu, struct nir_shader *nir, cha
 #ifdef VP_HACKRTCORE
    /* Direct traces wait for traversal before a shader can issue another.
     * One private spill range suffices for every direct trace in this kernel. */
+   bool has_pipeline_trace = false;
+   bool has_prepared_trace = false;
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
-            if (instr->type == nir_instr_type_intrinsic &&
-                nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_vortex_rt_wtrace) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+            if (op == nir_intrinsic_vortex_rt_wtrace_prepared)
+               has_prepared_trace = true;
+            if (op == nir_intrinsic_vortex_rt_wtrace) {
+               has_pipeline_trace = true;
                t.trace_spill_offset = ALIGN(nir->scratch_size, 64);
                nir->scratch_size = t.trace_spill_offset + VX_RT_QUERY_SPILL_BYTES;
                goto allocated_trace_spill;
@@ -6730,6 +6774,22 @@ allocated_trace_spill:
        * index-resolve merge block (cont_bb), not the original entry, which the
        * index-buffer branch already terminated. */
       emit_cfg(&t, impl, fn, LLVMGetInsertBlock(t.b));
+#ifdef VP_HACKRTCORE
+      /* Test submitted flags after every LLVM PHI has its incoming edges. */
+      if (t.ok && !has_pipeline_trace && has_prepared_trace) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+               if (in->intrinsic == nir_intrinsic_vortex_rt_wtrace_prepared &&
+                   vp_rt_flags_have_mask(t.mod, ssa_get(&t, in->src[1].ssa->index, 0),
+                                         VX_RT_FLAG_TRACE_PIPELINE))
+                  has_pipeline_trace = true;
+            }
+         }
+      }
+#endif
       if (t.ok) lower_uniform_dispatch_tables(&t, fn);
 
       free(t.val);
@@ -6768,6 +6828,10 @@ allocated_trace_spill:
    }
 
    char *err = NULL;
+#ifdef VP_HACKRTCORE
+   if (t.ok && has_pipeline_trace)
+      vp_lower_rt_resume_loops(t.mod);
+#endif
    bool ok = t.ok &&
              LLVMVerifyModule(t.mod, LLVMReturnStatusAction, &err) == 0;
    if (ok) {

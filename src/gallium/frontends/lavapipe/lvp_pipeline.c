@@ -257,6 +257,12 @@ optimize(nir_shader *nir)
       NIR_PASS(progress, nir, nir_copy_prop);
       NIR_PASS(progress, nir, nir_opt_dce);
 
+      if (nir->options->lower_integer_division) {
+         NIR_PASS(progress, nir, nir_opt_idiv_const, 8);
+         const nir_lower_idiv_options idiv_options = { .allow_fp16 = false };
+         NIR_PASS(progress, nir, nir_lower_idiv, &idiv_options);
+      }
+
       nir_opt_peephole_select_options peephole_select_options = {
          .limit = 8,
          .indirect_load_ok = true,

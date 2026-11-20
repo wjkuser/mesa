@@ -795,6 +795,11 @@ typedef struct nir_shader_compiler_options {
     * the next shader according to default_varying_estimate_instr_cost.
     */
    unsigned max_varying_expression_cost;
+
+   /** Integer division and remainder through 32 bits expand to an ALU sequence.
+    * Lower them before estimating the cost of speculative branch execution.
+    */
+   bool lower_integer_division;
 } nir_shader_compiler_options;
 
 #ifdef __cplusplus

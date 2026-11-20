@@ -653,6 +653,7 @@ vortexpipe_create_screen(struct sw_winsys *winsys)
    memcpy(vps->compiler_options,
           screen->get_compiler_options(screen, PIPE_SHADER_IR_NIR, PIPE_SHADER_COMPUTE),
           sizeof(*vps->compiler_options));
+   vps->compiler_options->lower_integer_division = true;
    vps->compiler_options->lower_ffma32 = false;
    vps->compiler_options->lower_ffma64 = false;
    screen->get_compiler_options = vp_get_compiler_options;

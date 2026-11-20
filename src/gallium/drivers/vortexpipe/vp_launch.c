@@ -100,13 +100,30 @@ struct vp_as_ctx {
    struct pipe_screen *screen;
    vx_device_h dev;
    vx_queue_h  q;
-   vx_buffer_h bufs[VP_MAX_BVH];
+   vx_buffer_h *bufs;
+   unsigned capacity;
    unsigned    n_bufs;
-   void       *stages[VP_MAX_BVH];
+   void       **stages;
    unsigned    n_stages;
    bool        has_rtu;   /* transcode AS to RTU scene instead of verbatim copy */
    bool        ok;
 };
+
+static bool
+vp_as_reserve(struct vp_as_ctx *c)
+{
+   if (c->n_bufs < c->capacity && c->n_stages < c->capacity)
+      return true;
+   unsigned capacity = c->capacity ? 2 * c->capacity : 8;
+   vx_buffer_h *bufs = realloc(c->bufs, capacity * sizeof(*bufs));
+   if (!bufs) return false;
+   c->bufs = bufs;
+   void **stages = realloc(c->stages, capacity * sizeof(*stages));
+   if (!stages) return false;
+   c->stages = stages;
+   c->capacity = capacity;
+   return true;
+}
 
 /* A derived AS image belongs to its source allocation. Compare the complete
  * transcode so TLAS and referenced BLAS updates both refresh device contents. */
@@ -139,10 +156,13 @@ vp_as_evict(struct pipe_screen *screen, uintptr_t base, uint64_t size)
    simple_mtx_unlock(&vps->resident_lock);
 }
 
-static uint64_t
+uint64_t
 vp_as_resident_address(struct vp_as_ctx *c, const void *source,
                        uint8_t *scene, uint32_t size)
 {
+   if (!vp_as_reserve(c)) {
+      free(scene); c->ok = false; return 0;
+   }
    struct vp_screen *vps = vp_reg_get(c->screen);
    simple_mtx_lock(&vps->resident_lock);
    struct vp_as_resident **link = &vps->as_resident;
@@ -164,11 +184,7 @@ vp_as_resident_address(struct vp_as_ctx *c, const void *source,
    if (!fresh) goto fail;
    fresh->bytes = malloc(size);
    if (!fresh->bytes) goto fail;
-   if (entry && entry->size == size) {
-      fresh->buffer = entry->buffer;
-      fresh->address = entry->address;
-      vx_buffer_retain(fresh->buffer);
-   } else if (vx_buffer_create(c->dev, size, VX_MEM_READ, &fresh->buffer) != VX_SUCCESS ||
+   if (vx_buffer_create(c->dev, size, VX_MEM_READ, &fresh->buffer) != VX_SUCCESS ||
               vx_buffer_address(fresh->buffer, &fresh->address) != VX_SUCCESS) {
       goto fail;
    }
@@ -223,7 +239,7 @@ vp_copy_as(struct vp_as_ctx *c, const void *bvh_host)
    }
    uint32_t size = ser - VP_ACCEL_SERIALIZATION_HDR - 8u * inst;
    if (size == 0 || size > VP_BVH_MAX_BYTES ||
-       c->n_stages >= VP_MAX_BVH || c->n_bufs >= VP_MAX_BVH) {
+       c->n_stages >= VP_MAX_BVH || c->n_bufs >= VP_MAX_BVH || !vp_as_reserve(c)) {
       mesa_loge("vortexpipe: launch: BVH too large / too many BVHs");
       c->ok = false;
       return 0;
@@ -250,6 +266,10 @@ vp_copy_as(struct vp_as_ctx *c, const void *bvh_host)
       }
    }
 
+   if (!vp_as_reserve(c)) {
+      c->ok = false;
+      return 0;
+   }
    vx_buffer_h b = NULL;
    uint64_t dev_addr = 0;
    if (vx_buffer_create(c->dev, size, 0, &b) != VX_SUCCESS) {
@@ -693,7 +713,7 @@ vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
 {
 #ifdef VP_HACKRTCORE
    uint32_t size = 0;
-   uint8_t *scene = vp_build_scene(tlas_host, &size);
+   uint8_t *scene = vp_build_scene(c, tlas_host, &size);
 #else
    struct vp_tri_list tl = { .ok = true };
    static const float kIdentity[12] = { 1,0,0,0, 0,1,0,0, 0,0,1,0 };
@@ -712,9 +732,6 @@ vp_transcode_as(struct vp_as_ctx *c, const void *tlas_host)
 #endif
    if (!scene) { c->ok = false; return 0; }
 
-   if (c->n_bufs >= VP_MAX_BVH || c->n_stages >= VP_MAX_BVH) {
-      free(scene); c->ok = false; return 0;
-   }
    return vp_as_resident_address(c, tlas_host, scene, size);
 }
 
@@ -774,6 +791,8 @@ vp_as_end(struct vp_as_ctx *c)
    for (unsigned i = 0; i < c->n_stages; i++) {
       free(c->stages[i]);
    }
+   free(c->bufs);
+   free(c->stages);
    free(c);
 }
 
@@ -1132,6 +1151,8 @@ done:
       if (asc.bufs[i]) vx_buffer_release(asc.bufs[i]);
    for (unsigned i = 0; i < asc.n_stages; i++)
       free(asc.stages[i]);
+   free(asc.bufs);
+   free(asc.stages);
    if (dbuf) vx_buffer_release(dbuf);
    if (scratch) vx_buffer_release(scratch);
    /* kbuf aliases *kernel_io and stays resident; the caller releases it. */

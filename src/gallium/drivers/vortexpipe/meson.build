@@ -115,7 +115,7 @@ files_vortexpipe = files(
   'vp_launch.c',
 )
 if get_option('vortex-rtu-path') != ''
-  files_vortexpipe += files('vp_nir_ray_query.c', 'vp_scene.cpp')
+  files_vortexpipe += files('vp_nir_ray_query.c', 'vp_rt_loops.cpp', 'vp_scene.cpp')
 else
   files_vortexpipe += files('vp_nir_lower_ray_tracing_to_rtu.c')
 endif
